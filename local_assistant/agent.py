@@ -17,6 +17,7 @@ from .terminal import (
     print_welcome,
     read_prompt_line,
     restore_terminal_features,
+    select_menu,
 )
 from .web import WEB_TOOL_SCHEMAS, WebTools
 from .workspace import TOOL_SCHEMAS, ToolError, WorkspaceTools
@@ -468,14 +469,42 @@ def interactive_cli(
             print(f"Active model : {model_name}")
             print(f"Model file   : {agent.model.model_file}")
             print(f"Context size : {agent.model.context_length // 1024}K tokens")
-            print(f"Reasoning    : {agent.model.reasoning_effort} (budget: {agent.model.thinking_budget_tokens})\n")
+            print(f"Reasoning    : {agent.model.reasoning_effort} (budget: {agent.model.thinking_budget_tokens})")
+            project_root = Path(__file__).resolve().parents[1]
+            models_dir = project_root / "models"
+            available = []
+            if models_dir.is_dir():
+                for gguf in models_dir.rglob("*.gguf"):
+                    if "mmproj" not in gguf.name.lower() and "mtp" not in gguf.name.lower():
+                        if gguf.resolve() != agent.model.model_file.resolve():
+                            available.append(gguf)
+            if available:
+                print("\nOther installed models on this laptop:")
+                for m in available:
+                    size_gb = m.stat().st_size / (1024**3)
+                    print(f"  • {display_model_name(m):<28} ({size_gb:.1f} GB)")
+                print("\nTo switch model, restart with:")
+                print(f'  luma -ModelPath "{available[0]}"')
+            print()
             continue
         if command in {"/cls", "/clear-screen"}:
             sys.stdout.write("\x1b[2J\x1b[H")
             sys.stdout.flush()
             continue
-        if command == "/permission":
-            agent.show_permission_mode()
+        if command in {"/permission", "/permissions"}:
+            selected = select_menu(
+                "Permission Mode",
+                [
+                    ("ask", "ask", "Ask before every file change and command (default)"),
+                    ("workspace", "workspace", "Auto-apply workspace file edits; ask before commands"),
+                    ("full", "full", "Run file changes and commands without approval"),
+                ],
+                current=agent.tools.permission_mode,
+            )
+            if selected:
+                agent.set_permission_mode(selected)
+            else:
+                agent.show_permission_mode()
             print()
             continue
         if command.startswith("/permission "):
@@ -486,6 +515,25 @@ def interactive_cli(
                 print("Usage: /permission ask|workspace|full")
             print()
             continue
+        if command == "/web":
+            selected = select_menu(
+                "Web Research",
+                [
+                    ("auto", "auto", "Automatic DuckDuckGo lookups when facts or searches needed"),
+                    ("off", "off", "Disable web research — fully offline session"),
+                ],
+                current="auto" if agent.web_enabled else "off",
+            )
+            if selected == "auto":
+                agent.set_web_enabled(True)
+                print()
+            elif selected == "off":
+                agent.set_web_enabled(False)
+                print()
+            else:
+                state = "enabled" if agent.web_enabled else "disabled"
+                print(f"Web research is currently {state}.\n")
+            continue
         if command in {"/web auto", "/web on"}:
             agent.set_web_enabled(True)
             print()
@@ -495,8 +543,33 @@ def interactive_cli(
             print()
             continue
         if command == "/effort":
-            agent.show_effort_settings()
-            print()
+            selected = select_menu(
+                "Reasoning Effort",
+                [
+                    ("none", "none", "Fast, direct answers — no thinking tokens"),
+                    ("low", "low", "Light reasoning"),
+                    ("medium", "medium", "Balanced reasoning (default)"),
+                    ("high", "high", "Deep reasoning — thorough deliberation"),
+                    ("budget", "budget", f"Custom token budget (current: {agent.model.thinking_budget_tokens})"),
+                ],
+                current=agent.model.reasoning_effort,
+            )
+            if selected == "budget":
+                try:
+                    val = input(f"\nEnter thinking budget in tokens (0-8192, current {agent.model.thinking_budget_tokens}): ").strip()
+                    if val.isdigit():
+                        agent.set_thinking_budget(int(val))
+                    else:
+                        print("Invalid number.")
+                except (EOFError, KeyboardInterrupt):
+                    pass
+                print()
+            elif selected:
+                agent.set_reasoning_effort(selected)
+                print()
+            else:
+                agent.show_effort_settings()
+                print()
             continue
         if command.startswith("/effort "):
             pieces = command.split()

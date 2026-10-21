@@ -1,4 +1,4 @@
-"""Small, dependency-free terminal welcome and slash-command input UI."""
+"""Small, dependency-free terminal welcome, slash-command input, and interactive menus."""
 
 from __future__ import annotations
 
@@ -33,35 +33,35 @@ _LOGO = (
 
 
 # ── Slash command definitions ────────────────────────────────────────
-# Each entry: (command, description, group, icon)
-
+# Clean root commands (what appears when typing '/')
 _COMMAND_GROUPS = (
     ("Session", (
-        ("/new",                "Start a fresh conversation (/clear also works)", "⟳"),
-        ("/workspace",          "Show the active workspace folder",               "📁"),
-        ("/model",              "Show active model and context info",             "🤖"),
-        ("/cls",                "Clear the terminal screen",                      "🧹"),
-        ("/help",               "Show this command list",                         "?"),
-        ("/exit",               "Stop the assistant (/quit also works)",          "⏻"),
+        ("/new",                "Start a fresh conversation (/clear)",       "⟳"),
+        ("/workspace",          "Show the active workspace folder",          "📁"),
+        ("/model",              "Show active model and context info",        "🤖"),
+        ("/cls",                "Clear the terminal screen",                 "🧹"),
+        ("/help",               "Show available commands",                   "?"),
+        ("/exit",               "Stop the assistant (/quit)",                "⏻"),
     )),
-    ("Permissions", (
-        ("/permission",         "Show current permission mode",              "🔒"),
-        ("/permission ask",     "Ask before every change and command",       "🔒"),
-        ("/permission workspace", "Auto-apply file edits; ask for commands", "🔓"),
-        ("/permission full",    "Run everything without approval",           "🔓"),
+    ("Settings", (
+        ("/permission",         "Switch permission mode (ask / workspace / full)", "🔒"),
+        ("/effort",             "Set reasoning effort or thinking budget",         "🧠"),
+        ("/web",                "Configure web research (auto / off)",            "🌐"),
     )),
-    ("Reasoning", (
-        ("/effort",             "Show current reasoning settings",           "🧠"),
-        ("/effort none",        "Fast, direct answers — no thinking",        "⚡"),
-        ("/effort low",         "Light reasoning",                           "💡"),
-        ("/effort medium",      "Balanced reasoning (default)",              "🧠"),
-        ("/effort high",        "Deep reasoning — slower but thorough",      "🔬"),
-        ("/effort budget ",     "Set token budget, e.g. /effort budget 512", "🎯"),
-    )),
-    ("Web", (
-        ("/web auto",           "Enable automatic web lookups",              "🌐"),
-        ("/web off",            "Disable web — fully offline session",       "📴"),
-    )),
+)
+
+# Extended completions for direct typing (e.g. /permission ask)
+_EXTENDED_COMPLETIONS = (
+    ("/permission ask", "Ask before every file change and command"),
+    ("/permission workspace", "Auto-apply workspace file edits; ask for commands"),
+    ("/permission full", "Run file changes and commands without per-action approval"),
+    ("/effort none", "Fast, direct answers — no thinking"),
+    ("/effort low", "Light reasoning"),
+    ("/effort medium", "Balanced reasoning (default)"),
+    ("/effort high", "Deeper reasoning — slower but thorough"),
+    ("/effort budget ", "Set token budget, e.g. /effort budget 512"),
+    ("/web auto", "Enable automatic web lookups"),
+    ("/web off", "Disable web — fully offline session"),
 )
 
 # Flattened for autocomplete matching
@@ -69,9 +69,9 @@ SLASH_COMPLETIONS: tuple[tuple[str, str], ...] = tuple(
     (cmd, desc)
     for _, entries in _COMMAND_GROUPS
     for cmd, desc, _ in entries
-)
+) + _EXTENDED_COMPLETIONS
 
-# Flattened with icons for the interactive menu
+# Flattened with icons for the interactive '/' popup
 _SLASH_MENU_ENTRIES: tuple[tuple[str, str, str, str], ...] = tuple(
     (cmd, desc, group, icon)
     for group, entries in _COMMAND_GROUPS
@@ -193,6 +193,92 @@ def print_command_menu() -> None:
     print(f"\n{muted}  Type / to browse commands · ↑↓ navigate · Tab complete · Enter run{reset}\n")
 
 
+def select_menu(
+    title: str,
+    options: list[tuple[str, str, str]],  # (id, label, description)
+    current: str | None = None,
+) -> str | None:
+    """Show an interactive in-place radio selection menu using arrow keys."""
+    if os.name != "nt" or not _VT_READY or not sys.stdin.isatty() or not sys.stdout.isatty():
+        print(f"\n{title}")
+        print("─" * 40)
+        for i, (opt_id, label, desc) in enumerate(options, 1):
+            active = " (current)" if opt_id == current else ""
+            print(f"  {i}. {label:<12} {desc}{active}")
+        try:
+            choice = input(f"\nSelect [1-{len(options)}] or press Enter to cancel: ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(options):
+                return options[int(choice) - 1][0]
+        except (EOFError, KeyboardInterrupt):
+            pass
+        return None
+
+    try:
+        import msvcrt
+    except ImportError:
+        return None
+
+    selected = 0
+    if current is not None:
+        for idx, (opt_id, _, _) in enumerate(options):
+            if opt_id == current:
+                selected = idx
+                break
+
+    width = max(30, shutil.get_terminal_size((100, 30)).columns)
+    separator = "─" * min(width - 4, 64)
+    total_lines = len(options) + 2
+
+    def render(is_first: bool = False) -> None:
+        if not is_first:
+            sys.stdout.write(f"\r\x1b[{total_lines}A")
+        sys.stdout.write("\x1b[J")
+        sys.stdout.write(f"  \x1b[1;97m{title}\x1b[0m  \x1b[90m·  ↑↓ choose  ·  Enter select  ·  Esc cancel\x1b[0m\r\n")
+        sys.stdout.write(f"  \x1b[90m{separator}\x1b[0m\r\n")
+        for idx, (opt_id, label, desc) in enumerate(options):
+            is_active = (opt_id == current)
+            radio = "●" if is_active else "○"
+            active_badge = " \x1b[92m(active)\x1b[0m" if is_active else ""
+            if idx == selected:
+                line = f"  \x1b[96m› {radio} {label:<12}\x1b[0m \x1b[1;97m{desc}\x1b[0m{active_badge}"
+            else:
+                line = f"  \x1b[90m  {radio} {label:<12} {desc}{active_badge}\x1b[0m"
+            sys.stdout.write(line + "\r\n")
+        sys.stdout.flush()
+
+    render(is_first=True)
+
+    try:
+        while True:
+            key = msvcrt.getwch()
+            if key == "\r":
+                sys.stdout.write(f"\r\x1b[{total_lines}A\x1b[J")
+                sys.stdout.flush()
+                return options[selected][0]
+            if key in ("\x1b", "\x03"):
+                sys.stdout.write(f"\r\x1b[{total_lines}A\x1b[J")
+                sys.stdout.flush()
+                return None
+            if key.isdigit():
+                num = int(key)
+                if 1 <= num <= len(options):
+                    sys.stdout.write(f"\r\x1b[{total_lines}A\x1b[J")
+                    sys.stdout.flush()
+                    return options[num - 1][0]
+            if key in ("\x00", "\xe0"):
+                code = msvcrt.getwch()
+                if code in ("H", "K"):
+                    selected = (selected - 1) % len(options)
+                    render(is_first=False)
+                elif code in ("P", "M"):
+                    selected = (selected + 1) % len(options)
+                    render(is_first=False)
+    except (EOFError, KeyboardInterrupt):
+        sys.stdout.write(f"\r\x1b[{total_lines}A\x1b[J")
+        sys.stdout.flush()
+        return None
+
+
 def read_prompt_line(prompt: str = "You › ") -> str:
     """Read a line; on Windows, show slash suggestions as soon as '/' is typed."""
     if os.name != "nt" or not _VT_READY or not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -209,13 +295,17 @@ def read_prompt_line(prompt: str = "You › ") -> str:
     previous_cursor_row = 0
     width = max(20, shutil.get_terminal_size((100, 30)).columns)
 
-    color = True  # We know _VT_READY and isatty
-
     def matches() -> list[tuple[str, str, str, str]]:
         if dismissed or not buffer.startswith("/"):
             return []
         prefix = buffer.casefold()
-        return [e for e in _SLASH_MENU_ENTRIES if e[0].casefold().startswith(prefix)]
+        if " " not in buffer:
+            return [e for e in _SLASH_MENU_ENTRIES if e[0].casefold().startswith(prefix)]
+        return [
+            (cmd, desc, "Options", "›")
+            for cmd, desc in _EXTENDED_COMPLETIONS
+            if cmd.casefold().startswith(prefix)
+        ]
 
     def redraw() -> None:
         nonlocal previous_cursor_row
@@ -236,11 +326,9 @@ def read_prompt_line(prompt: str = "You › ") -> str:
         if suggestions:
             max_items = max(1, min(len(suggestions), shutil.get_terminal_size((100, 30)).lines - 5))
             visible = suggestions[:max_items]
-            # Header
             header = "  ↑↓ select · Tab complete · Enter run · Esc close"
             sys.stdout.write("\r\n")
             sys.stdout.write("\x1b[90m" + header[:width - 1] + "\x1b[0m\r\n")
-            # Group-aware rendering
             last_group = ""
             rendered = 0
             for index, (cmd, desc, group, icon) in enumerate(visible):
@@ -254,7 +342,6 @@ def read_prompt_line(prompt: str = "You › ") -> str:
                     row = f" {marker} \x1b[96m{cmd:<25}\x1b[0m \x1b[1;97m{icon}  {desc}\x1b[0m"
                 else:
                     row = f" {marker} \x1b[90m{cmd:<25} {icon}  {desc}\x1b[0m"
-                # Truncate to terminal width (ignoring ANSI escape lengths)
                 sys.stdout.write(row + "\r\n")
                 rendered += 1
             menu_rows = 1 + rendered
@@ -283,7 +370,6 @@ def read_prompt_line(prompt: str = "You › ") -> str:
             if options and buffer != options[selected % len(options)][0]:
                 buffer = options[selected % len(options)][0]
                 cursor = len(buffer)
-            # Remove the suggestion panel, leaving a normal command line in scrollback.
             dismissed = True
             redraw()
             sys.stdout.write("\r\n")
