@@ -86,26 +86,26 @@ During a session, use `/effort none|low|medium|high` or `/effort budget N` (0–
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  Terminal UI (terminal.py)                       │
-│  Slash commands · ANSI rendering · Tab complete  │
+│  Terminal UI (terminal.py)                      │
+│  Slash commands · ANSI rendering · Tab complete │
 ├─────────────────────────────────────────────────┤
-│  Agent Loop (agent.py)                           │
-│  System prompt · Tool dispatch · History trim    │
+│  Agent Loop (agent.py)                          │
+│  System prompt · Tool dispatch · History trim   │
 │  Qwen XML tool-call parser · Stream printer     │
 ├──────────────────────┬──────────────────────────┤
-│  Workspace Tools     │  Web Tools (web.py)       │
-│  (workspace.py)      │  DuckDuckGo search        │
-│  File CRUD · Search  │  HTTPS page extraction    │
-│  PowerShell runner   │  SSRF protection          │
-│  Permission gates    │                           │
+│  Workspace Tools     │  Web Tools (web.py)      │
+│  (workspace.py)      │  DuckDuckGo search       │
+│  File CRUD · Search  │  HTTPS page extraction   │
+│  PowerShell runner   │  SSRF protection         │
+│  Permission gates    │                          │
 ├──────────────────────┴──────────────────────────┤
-│  Runtime (runtime.py)                            │
-│  llama-server lifecycle · OpenAI-compatible API  │
-│  Streaming SSE · Model auto-detection            │
-│  Windows Job Object cleanup                      │
+│  Runtime (runtime.py)                           │
+│  llama-server lifecycle · OpenAI-compatible API │
+│  Streaming SSE · Model auto-detection           │
+│  Windows Job Object cleanup                     │
 ├─────────────────────────────────────────────────┤
-│  llama.cpp (runtime/llama.cpp/)                  │
-│  CUDA inference · loopback-only · API key        │
+│  llama.cpp (runtime/llama.cpp/)                 │
+│  CUDA inference · loopback-only · API key       │
 └─────────────────────────────────────────────────┘
 ```
 
