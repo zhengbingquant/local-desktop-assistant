@@ -55,7 +55,7 @@ luma -ModelPath "C:\path\to\any-model.gguf"
 - **Propose file changes** — creation, replacement, and deletion. The CLI prints a diff; approval follows the active `/permission` mode.
 - **Run PowerShell commands** — the full command and working directory are shown; approval depends on `/permission`.
 - **Web research** — automatic DuckDuckGo lookups when useful. Each web action is shown in the terminal. Use `/web off` for a fully offline session.
-- **Session controls** — `/new` resets the conversation, `/workspace` shows the active folder, `/effort` tunes reasoning depth, `/permission` sets tool approvals.
+- **Session controls** — `/new` resets the conversation, `/workspace` shows the active folder, `/model` inspects the active model and context, `/cls` clears the terminal, `/effort` tunes reasoning depth, `/permission` sets tool approvals.
 
 ## Permission modes
 

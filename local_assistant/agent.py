@@ -463,6 +463,17 @@ def interactive_cli(
         if command == "/workspace":
             print(f"Workspace: {agent.workspace}\n")
             continue
+        if command == "/model":
+            model_name = display_model_name(agent.model.model_file)
+            print(f"Active model : {model_name}")
+            print(f"Model file   : {agent.model.model_file}")
+            print(f"Context size : {agent.model.context_length // 1024}K tokens")
+            print(f"Reasoning    : {agent.model.reasoning_effort} (budget: {agent.model.thinking_budget_tokens})\n")
+            continue
+        if command in {"/cls", "/clear-screen"}:
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+            continue
         if command == "/permission":
             agent.show_permission_mode()
             print()

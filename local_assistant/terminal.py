@@ -9,6 +9,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 _VT_READY = False
 
@@ -21,35 +31,58 @@ _LOGO = (
     "╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝",
 )
 
-SLASH_HELP = (
-    ("/help", "Show this command list"),
-    ("/new", "Start a fresh conversation (/clear also works)"),
-    ("/workspace", "Show the folder the assistant can access"),
-    ("/permission", "Choose ask, workspace, or full access for this session"),
-    ("/effort", "Set reasoning depth or its token budget"),
-    ("/web auto", "Allow automatic web lookups when useful"),
-    ("/web off", "Disable web access for this session"),
-    ("/exit", "Stop the assistant (/quit also works)"),
+
+# ── Slash command definitions ────────────────────────────────────────
+# Each entry: (command, description, group, icon)
+
+_COMMAND_GROUPS = (
+    ("Session", (
+        ("/new",                "Start a fresh conversation (/clear also works)", "⟳"),
+        ("/workspace",          "Show the active workspace folder",               "📁"),
+        ("/model",              "Show active model and context info",             "🤖"),
+        ("/cls",                "Clear the terminal screen",                      "🧹"),
+        ("/help",               "Show this command list",                         "?"),
+        ("/exit",               "Stop the assistant (/quit also works)",          "⏻"),
+    )),
+    ("Permissions", (
+        ("/permission",         "Show current permission mode",              "🔒"),
+        ("/permission ask",     "Ask before every change and command",       "🔒"),
+        ("/permission workspace", "Auto-apply file edits; ask for commands", "🔓"),
+        ("/permission full",    "Run everything without approval",           "🔓"),
+    )),
+    ("Reasoning", (
+        ("/effort",             "Show current reasoning settings",           "🧠"),
+        ("/effort none",        "Fast, direct answers — no thinking",        "⚡"),
+        ("/effort low",         "Light reasoning",                           "💡"),
+        ("/effort medium",      "Balanced reasoning (default)",              "🧠"),
+        ("/effort high",        "Deep reasoning — slower but thorough",      "🔬"),
+        ("/effort budget ",     "Set token budget, e.g. /effort budget 512", "🎯"),
+    )),
+    ("Web", (
+        ("/web auto",           "Enable automatic web lookups",              "🌐"),
+        ("/web off",            "Disable web — fully offline session",       "📴"),
+    )),
 )
 
-SLASH_COMPLETIONS = (
-    ("/help", "Show available commands"),
-    ("/new", "Start a fresh conversation"),
-    ("/workspace", "Show the active workspace folder"),
-    ("/permission", "Show the current permission mode"),
-    ("/permission ask", "Ask before every file change and shell command"),
-    ("/permission workspace", "Auto-apply workspace edits; ask before shell commands"),
-    ("/permission full", "Run file changes and commands without per-action approval"),
-    ("/effort", "Show current reasoning settings"),
-    ("/effort none", "Fast, direct answers"),
-    ("/effort low", "Light reasoning"),
-    ("/effort medium", "Balanced reasoning"),
-    ("/effort high", "Deeper reasoning"),
-    ("/effort budget ", "Set a reasoning-token budget, for example 512"),
-    ("/web auto", "Use web lookups when a question needs them"),
-    ("/web off", "Disable web access for this session"),
-    ("/web on", "Alias for /web auto"),
-    ("/exit", "Stop the assistant"),
+# Flattened for autocomplete matching
+SLASH_COMPLETIONS: tuple[tuple[str, str], ...] = tuple(
+    (cmd, desc)
+    for _, entries in _COMMAND_GROUPS
+    for cmd, desc, _ in entries
+)
+
+# Flattened with icons for the interactive menu
+_SLASH_MENU_ENTRIES: tuple[tuple[str, str, str, str], ...] = tuple(
+    (cmd, desc, group, icon)
+    for group, entries in _COMMAND_GROUPS
+    for cmd, desc, icon in entries
+)
+
+# Static help output (for /help and non-interactive terminals)
+SLASH_HELP = tuple(
+    (cmd, desc)
+    for _, entries in _COMMAND_GROUPS
+    for cmd, desc, _ in entries
 )
 
 
@@ -135,12 +168,29 @@ def print_welcome(workspace: Path, model_file: Path, context_length: int, web_mo
 
 
 def print_command_menu() -> None:
+    color = sys.stdout.isatty() and _VT_READY
+    white = "\x1b[1;97m" if color else ""
+    muted = "\x1b[90m" if color else ""
+    cyan = "\x1b[96m" if color else ""
+    reset = "\x1b[0m" if color else ""
+
     width = max(48, shutil.get_terminal_size((100, 30)).columns)
-    print("Available commands")
-    print("─" * min(width, 76))
-    for command, description in SLASH_HELP:
-        print(f"  {command:<27} {description}")
-    print("\nType / to browse and filter commands; use ↑/↓, Tab, and Enter.\n")
+    separator = "─" * min(width, 76)
+
+    print(f"\n{white}Commands{reset}")
+    print(f"{muted}{separator}{reset}")
+
+    last_group = ""
+    for group, entries in _COMMAND_GROUPS:
+        if group != last_group:
+            if last_group:
+                print()
+            print(f"  {muted}{group}{reset}")
+            last_group = group
+        for cmd, desc, icon in entries:
+            print(f"    {cyan}{cmd:<25}{reset} {muted}{icon}  {desc}{reset}")
+
+    print(f"\n{muted}  Type / to browse commands · ↑↓ navigate · Tab complete · Enter run{reset}\n")
 
 
 def read_prompt_line(prompt: str = "You › ") -> str:
@@ -159,11 +209,13 @@ def read_prompt_line(prompt: str = "You › ") -> str:
     previous_cursor_row = 0
     width = max(20, shutil.get_terminal_size((100, 30)).columns)
 
-    def matches() -> list[tuple[str, str]]:
+    color = True  # We know _VT_READY and isatty
+
+    def matches() -> list[tuple[str, str, str, str]]:
         if dismissed or not buffer.startswith("/"):
             return []
         prefix = buffer.casefold()
-        return [entry for entry in SLASH_COMPLETIONS if entry[0].casefold().startswith(prefix)]
+        return [e for e in _SLASH_MENU_ENTRIES if e[0].casefold().startswith(prefix)]
 
     def redraw() -> None:
         nonlocal previous_cursor_row
@@ -184,18 +236,28 @@ def read_prompt_line(prompt: str = "You › ") -> str:
         if suggestions:
             max_items = max(1, min(len(suggestions), shutil.get_terminal_size((100, 30)).lines - 5))
             visible = suggestions[:max_items]
-            menu_header = "  COMMANDS  ·  ↑↓ select  ·  Tab complete  ·  Enter run  ·  Esc hide"
+            # Header
+            header = "  ↑↓ select · Tab complete · Enter run · Esc close"
             sys.stdout.write("\r\n")
-            sys.stdout.write("\x1b[2m" + menu_header[:width - 1] + "\x1b[0m\r\n")
-            for index, (command, description) in enumerate(visible):
+            sys.stdout.write("\x1b[90m" + header[:width - 1] + "\x1b[0m\r\n")
+            # Group-aware rendering
+            last_group = ""
+            rendered = 0
+            for index, (cmd, desc, group, icon) in enumerate(visible):
+                if group != last_group:
+                    if last_group:
+                        sys.stdout.write("\x1b[90m  ─\x1b[0m\r\n")
+                        rendered += 1
+                    last_group = group
                 marker = "›" if index == selected else " "
-                row = f" {marker} {command:<25} {description}"
-                row = row[:width - 1]
                 if index == selected:
-                    sys.stdout.write("\x1b[1;97m" + row + "\x1b[0m\r\n")
+                    row = f" {marker} \x1b[96m{cmd:<25}\x1b[0m \x1b[1;97m{icon}  {desc}\x1b[0m"
                 else:
-                    sys.stdout.write(row + "\r\n")
-            menu_rows = 1 + len(visible)
+                    row = f" {marker} \x1b[90m{cmd:<25} {icon}  {desc}\x1b[0m"
+                # Truncate to terminal width (ignoring ANSI escape lengths)
+                sys.stdout.write(row + "\r\n")
+                rendered += 1
+            menu_rows = 1 + rendered
             sys.stdout.write("\x1b[" + str(input_rows + menu_rows) + "A")
             if cursor_row:
                 sys.stdout.write("\x1b[" + str(cursor_row) + "B")
