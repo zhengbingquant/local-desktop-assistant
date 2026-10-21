@@ -95,7 +95,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Propose creating or replacing a UTF-8 text file inside the workspace. Show a unified diff; confirmation depends on the active /permission mode (ask by default, workspace and full can apply without per-action approval).",
+            "description": "Create a new text file or overwrite an existing file in the workspace with UTF-8 content. Always call this tool directly when creating or updating files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -111,7 +111,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "replace_text",
-            "description": "Propose replacing one exact, unique text block in a UTF-8 workspace file. Show a diff; confirmation depends on the active /permission mode.",
+            "description": "Replace an exact, unique text block in a workspace UTF-8 text file. Always call this tool directly when editing files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -128,7 +128,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "delete_file",
-            "description": "Propose deleting a single file inside the workspace. Show the file path and diff; confirmation depends on the active /permission mode. Directories cannot be deleted with this tool.",
+            "description": "Delete a single file inside the workspace. Always call this tool directly when a file needs to be deleted. Directories cannot be deleted with this tool.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -141,11 +141,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_command",
-            "description": "Propose a PowerShell command to run from the workspace. Show the exact command; ask and workspace modes require approval, while full mode runs it without per-action approval as the signed-in Windows user.",
+            "description": "Execute a PowerShell command in the workspace. Use this tool whenever you need to create directories, run scripts, execute terminal commands, install packages, or inspect system state. Always call this tool directly. Quote paths containing spaces.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string"},
+                    "command": {"type": "string", "description": "The exact PowerShell command to execute (quote paths containing spaces)"},
                     "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
                 },
                 "required": ["command"],
