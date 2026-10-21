@@ -50,6 +50,7 @@ CRITICAL ACTION RULES:
 5. When the user reports that a file or folder is missing, empty, or an error occurred, do NOT just explain or output markdown code. Actively FIX it by calling the appropriate tool (write_file, run_command) directly to create the missing files.
 6. Do NOT ask for permission in conversational text before calling tools. The host application handles user approval prompts automatically when required. Call the tool immediately.
 7. Use real, concrete paths. Paths frequently contain spaces (e.g., 'C:\Users\Teh Bing Quan\...'). Always wrap paths in single or double quotes in PowerShell commands. Prefer workspace-relative paths where applicable.
+8. Interactive programs & games: run_command executes non-interactively (without keyboard stdin). If testing or launching an interactive CLI game or program that calls input(), launch it in a new window using Start-Process powershell -ArgumentList '-NoExit', '-Command', 'python <path>' so the player can actually play.
 
 The host enforces the active permission mode. list_files, read_file, and
 search_text are read-only and file tools stay inside the selected workspace.
