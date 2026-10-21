@@ -167,6 +167,8 @@ class LocalModelServer:
         self._temp_dir = tempfile.TemporaryDirectory(prefix="local-assistant-")
         self._log_file = Path(self._temp_dir.name) / "llama-server.log"
         self.port = self._free_local_port()
+        model_name_lower = self.model_file.name.lower()
+        is_reasoning = any(tag in model_name_lower for tag in ("qwen3", "deepseek-r1", "reasoning", "thinking"))
         command = [
             str(self.server_exe),
             "--model", str(self.model_file),
@@ -182,16 +184,26 @@ class LocalModelServer:
             "--ubatch-size", "128",
             "--cache-type-k", self.kv_cache_type,
             "--cache-type-v", self.kv_cache_type,
-            "--reasoning", "on",
-            "--reasoning-effort", self.reasoning_effort,
-            "--temp", "1.0",
-            "--top-p", "0.95",
-            "--top-k", "20",
             "--jinja",
             "--offline",
             "--no-webui",
             "--no-agent",
         ]
+        if is_reasoning:
+            command.extend([
+                "--reasoning", "on",
+                "--reasoning-effort", self.reasoning_effort,
+                "--temp", "1.0",
+                "--top-p", "0.95",
+                "--top-k", "20",
+            ])
+        else:
+            command.extend([
+                "--reasoning", "off",
+                "--temp", "0.2",
+                "--top-p", "0.9",
+                "--top-k", "40",
+            ])
         if self.cpu_threads is not None:
             command.extend(["--threads", str(self.cpu_threads)])
         if self.batch_threads is not None:
@@ -298,18 +310,21 @@ class LocalModelServer:
         tools: list[dict[str, Any]],
         on_text: Callable[[str], None],
     ) -> dict[str, Any]:
+        is_reasoning = any(tag in self.model_file.name.lower() for tag in ("qwen3", "deepseek-r1", "reasoning", "thinking"))
+        max_tokens_val = max(2048, min(4096, self.context_length - 1024))
         body: dict[str, Any] = {
             "model": self.model_file.stem,
             "messages": messages,
-            "temperature": 1.0,
-            "top_p": 0.95,
-            "top_k": 20,
-            "max_tokens": 2048,
+            "temperature": 1.0 if is_reasoning else 0.2,
+            "top_p": 0.95 if is_reasoning else 0.9,
+            "top_k": 20 if is_reasoning else 40,
+            "max_tokens": max_tokens_val,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "reasoning_effort": self.reasoning_effort,
-            "thinking_budget_tokens": self.thinking_budget_tokens,
         }
+        if is_reasoning:
+            body["reasoning_effort"] = self.reasoning_effort
+            body["thinking_budget_tokens"] = self.thinking_budget_tokens
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
@@ -394,6 +409,11 @@ class LocalModelServer:
                             entry["function"]["arguments"] += json.dumps(arguments, ensure_ascii=False)
         except urllib.error.HTTPError as exc:
             detail = exc.read(16_000).decode("utf-8", errors="replace")
+            if exc.code == 500 and ("missing closing quote" in detail or "parse error" in detail):
+                raise ModelError(
+                    "The model's code output hit the response token limit and was cut off mid-tool call.\n"
+                    "Tip: Ask the model to build the project modularly step-by-step or write smaller files."
+                ) from exc
             raise ModelError(f"Local model returned HTTP {exc.code}: {detail}") from exc
         except (OSError, urllib.error.URLError) as exc:
             raise ModelError(f"Could not get a response from the local model: {exc}") from exc

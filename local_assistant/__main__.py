@@ -11,7 +11,9 @@ from .agent import launch_agent
 def main() -> int:
     project_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="Run a local Qwen coding assistant with approval-gated tools.")
-    default_model_file = project_root / "models" / "Qwen3.8-27B-HF" / "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    coder_7b_file = project_root / "models" / "Qwen2.5-Coder-7B" / "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+    default_27b_file = project_root / "models" / "Qwen3.8-27B-HF" / "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    default_model_file = coder_7b_file if coder_7b_file.is_file() else default_27b_file
     parser.add_argument(
         "--workspace",
         type=Path,

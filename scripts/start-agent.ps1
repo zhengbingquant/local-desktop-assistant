@@ -27,7 +27,9 @@ if ($EnableWeb -and $DisableWeb) {
 }
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $entryPoint = Join-Path $projectRoot 'local_assistant\__main__.py'
-$defaultModel = Join-Path $projectRoot 'models\Qwen3.8-27B-HF\Qwen3.8-27B-UD-Q4_K_XL.gguf'
+$coderModel = Join-Path $projectRoot 'models\Qwen2.5-Coder-7B\qwen2.5-coder-7b-instruct-q4_k_m.gguf'
+$qwen27bModel = Join-Path $projectRoot 'models\Qwen3.8-27B-HF\Qwen3.8-27B-UD-Q4_K_XL.gguf'
+$defaultModel = if (Test-Path -LiteralPath $coderModel) { $coderModel } else { $qwen27bModel }
 $modelFile = if ($ModelPath) { [IO.Path]::GetFullPath($ModelPath) } else { $defaultModel }
 $draftModel = Join-Path $projectRoot 'models\Qwen3.8-27B-HF\MTP\mtp-Qwen3.8-27B-Q4_0.gguf'
 $workspace = [IO.Path]::GetFullPath($WorkspacePath)
@@ -77,7 +79,8 @@ if ([version]::new([int]$Matches[1], [int]$Matches[2]) -lt [version]::new(3, 11)
 }
 
 try {
-    $Host.UI.RawUI.WindowTitle = 'Local Assistant | Qwen3.8-27B'
+    $modelTitle = [System.IO.Path]::GetFileNameWithoutExtension($modelFile).Split("-UD-")[0].Split("-q4")[0]
+    $Host.UI.RawUI.WindowTitle = "Local Assistant | $modelTitle"
 } catch {
     # A host without a console title can still run the CLI.
 }

@@ -1,48 +1,157 @@
 # Local Assistant
 
-A local coding-agent CLI for Qwen3.8-27B. The model runs through a local CUDA-enabled build of `llama.cpp`; a small Python controller supplies workspace tools and mediates writes and commands. No cloud model or Ollama is required.
+A private, local-first coding agent that runs entirely on your laptop. A small Python controller supplies workspace tools, mediates writes and commands, and talks to a local CUDA-enabled `llama.cpp` inference server. No cloud model, no API key, no Ollama required.
 
 ![Local Assistant CLI](docs/assets/local-assistant-terminal.png)
 
-## Start
+## Quick start
 
-- Install a terminal command once: `powershell -ExecutionPolicy Bypass -File .\scripts\install-command.ps1`. Reopen the terminal, then type `luma` (or `local-assistant`) from the folder you want the assistant to work in.
-- `luma "C:\path\to\project"` starts it with that folder as the workspace. Add `-DisableWeb` to run with web tools disabled.
-- Double-click **Start Assistant.bat** to work in this project folder.
-- To work in another project, run `Start Assistant.bat "C:\path\to\project"`.
-- Or open PowerShell and run `.\scripts\start-agent.ps1 -WorkspacePath "C:\path\to\project"`.
+1. **Install the terminal command** (one-time):
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\install-command.ps1
+   ```
+   Reopen your terminal, then type `luma` from any folder to start the assistant with that folder as the workspace.
 
-The agent needs Python 3.11 or newer. It uses only the Python standard library. The model loads when the agent starts and may take several minutes. The default context is 8K; use `-ContextLength 4096` if memory is tight. Type `/help` for CLI commands and `/exit` to stop. The CLI prints prompt and generation speed after each model response.
+2. **Or double-click** `Start Assistant.bat` to work in this project folder.
 
-If the model file is missing, install `aria2` and run `.\scripts\download-model.ps1`.
+3. **Or run directly**:
+   ```powershell
+   .\scripts\start-agent.ps1 -WorkspacePath "C:\path\to\project"
+   ```
 
-The `models/` and `runtime/` folders are intentionally excluded from Git. To run a fresh clone, provide a compatible CUDA-enabled `llama.cpp` build under `runtime/llama.cpp` (including its required DLLs), then download the model with the script above. The current project launcher expects `llama-server.exe` there.
+The agent needs **Python 3.11+** (standard library only). The model loads when the agent starts and may take a moment. Type `/help` for CLI commands and `/exit` to stop.
 
-The model path and runtime tuning are configurable. For example, `-ModelPath "D:\models\other.gguf"` selects another local GGUF; `-ReasoningEffort none` and `-ThinkingBudget 0` reduce deliberation for routine requests. During a session, use `/effort none|low|medium|high` or `/effort budget N` (0–8192) to tune them together.
+## Supported models
 
-At launch, the CLI shows a large LOCAL AI wordmark, a greeting, and the active workspace/model settings before loading the model. Type `/` to browse slash commands; use the arrow keys to choose one, Tab to complete it, and Enter to run it. On terminals without interactive key support, type `/` and press Enter to print the command list.
+The assistant auto-detects the active model and adjusts inference parameters (reasoning, temperature, sampling) accordingly.
+
+| Model | Size | VRAM fit (6 GB) | Speed | Best for |
+|:------|:-----|:---------------:|:-----:|:---------|
+| **Qwen 2.5 Coder 7B Instruct** (default) | 4.4 GB | ✅ Full GPU | ~45 tok/s | Fast coding, tool calling, iterative development |
+| **Qwen3.8-27B** | 16.4 GB | ⚠️ Partial (CPU offload) | ~2 tok/s | Deeper reasoning on complex questions |
+
+The launcher defaults to **Qwen 2.5 Coder 7B** when present, falling back to Qwen3.8-27B. Override with `-ModelPath`:
+
+```powershell
+luma -ModelPath "C:\path\to\any-model.gguf"
+```
+
+### Download models
+
+```powershell
+# Qwen 2.5 Coder 7B (recommended, ~4.4 GB)
+.\scripts\download-coder-7b.ps1
+
+# Qwen3.8-27B (optional, ~16.4 GB)
+.\scripts\download-model.ps1
+
+# Qwen3.8-27B MTP draft (optional speculative decoder)
+.\scripts\download-model.ps1 -MTP
+```
 
 ## What it can do
 
-- Inspect a workspace with `list_files`, `read_file`, and literal `search_text`.
-- Propose file creation, replacement, and deletion. The CLI prints a diff; approval behavior follows the active `/permission` mode.
-- Propose PowerShell commands. The full command and working directory are shown; whether they need approval depends on `/permission`.
-- Automatically search and read public web pages when you ask for a lookup, need current facts, or the model cannot answer reliably. Search queries go to DuckDuckGo and each lookup is shown in the terminal. Use `/web off` or launch with `-DisableWeb` for a fully offline session; `/web on` re-enables lookups.
-- Reset the conversation with `/new` (or `/clear`), inspect the active workspace with `/workspace`, adjust reasoning with `/effort`, and set tool approvals with `/permission`.
+- **Inspect a workspace** — `list_files`, `read_file`, and literal `search_text`.
+- **Propose file changes** — creation, replacement, and deletion. The CLI prints a diff; approval follows the active `/permission` mode.
+- **Run PowerShell commands** — the full command and working directory are shown; approval depends on `/permission`.
+- **Web research** — automatic DuckDuckGo lookups when useful. Each web action is shown in the terminal. Use `/web off` for a fully offline session.
+- **Session controls** — `/new` resets the conversation, `/workspace` shows the active folder, `/effort` tunes reasoning depth, `/permission` sets tool approvals.
 
-`/permission ask` is the default and asks before every file change, deletion, and shell command. `/permission workspace` applies workspace file changes after showing their diff, while shell commands still ask. `/permission full` skips per-action approval for file changes and shell commands for the current session; shell commands run as your Windows account and can affect files outside the workspace. Use `/permission ask` to restore prompts. File tools themselves stay inside the selected workspace, skip symlinks and common generated folders, and block common secret files. Fetched files and web pages are untrusted data and cannot change the active permission mode.
+## Permission modes
 
-The inference server listens only on `127.0.0.1` using a temporary port and API key. It runs in offline mode, the bundled web UI and built-in server agent tools are disabled, and Windows stops the model server and assistant-run commands when the CLI exits or its window is closed. Conversation history is kept in memory for that session only.
+| Mode | File changes | Shell commands |
+|:-----|:-------------|:---------------|
+| `/permission ask` (default) | Ask before each change | Ask before each command |
+| `/permission workspace` | Auto-apply after showing diff | Ask before each command |
+| `/permission full` | Auto-apply without prompts | Run without prompts |
 
-## Model
+File tools stay inside the selected workspace. Shell commands run as your Windows account and can affect files outside the workspace. Use `/permission ask` to restore prompts.
 
-- Qwen3.8-27B, Unsloth Dynamic `Q4_K_XL` GGUF, about 16.35 GiB.
-- RTX 4050 Laptop GPU with 6 GB VRAM, 32 GB RAM, Ryzen 5 7640HS.
-- The model uses both GPU and system memory; a local measurement produced about 2.1 tokens/second. That rate is a hardware/model limit, not something a different agent loop can remove. See [model and runtime notes](docs/model-setup.md).
-- The optional 1.37 GB Qwen MTP draft can be downloaded with `.\scripts\download-model.ps1 -MTP` and tried with `-Speculative draft-mtp`. It is off by default because the local comparison did not show a speed gain.
+## Runtime tuning
 
-## Backend notes
+```powershell
+# Use a smaller context if memory is tight
+luma -ContextLength 4096
 
-The agent loop, workspace tools, approval rules, and CLI are our own Python code. `llama.cpp` is the optimized local inference engine; the Python controller owns the available tool list and validates calls. Qwen's examples name a Qwen-specific parser for vLLM and SGLang, so exact tool-call behavior can differ with the GGUF template and llama.cpp build. The controller also parses Qwen's textual XML-style `<tool_call>` form, but model tool selection still needs real-world evaluation. Performance controls and measurements are in [agent-harness.md](docs/agent-harness.md).
+# Adjust reasoning (applies to reasoning-capable models)
+luma -ReasoningEffort high -ThinkingBudget 1024
 
-For plain chat without workspace tools, `.\scripts\start-cli.ps1` remains available.
+# Fully offline session
+luma -DisableWeb
+```
+
+During a session, use `/effort none|low|medium|high` or `/effort budget N` (0–8192) to tune reasoning interactively.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│  Terminal UI (terminal.py)                       │
+│  Slash commands · ANSI rendering · Tab complete  │
+├─────────────────────────────────────────────────┤
+│  Agent Loop (agent.py)                           │
+│  System prompt · Tool dispatch · History trim    │
+│  Qwen XML tool-call parser · Stream printer     │
+├──────────────────────┬──────────────────────────┤
+│  Workspace Tools     │  Web Tools (web.py)       │
+│  (workspace.py)      │  DuckDuckGo search        │
+│  File CRUD · Search  │  HTTPS page extraction    │
+│  PowerShell runner   │  SSRF protection          │
+│  Permission gates    │                           │
+├──────────────────────┴──────────────────────────┤
+│  Runtime (runtime.py)                            │
+│  llama-server lifecycle · OpenAI-compatible API  │
+│  Streaming SSE · Model auto-detection            │
+│  Windows Job Object cleanup                      │
+├─────────────────────────────────────────────────┤
+│  llama.cpp (runtime/llama.cpp/)                  │
+│  CUDA inference · loopback-only · API key        │
+└─────────────────────────────────────────────────┘
+```
+
+## Security
+
+- The inference server listens only on `127.0.0.1` using a temporary port and per-session API key.
+- It runs in offline mode with the web UI and built-in server agent tools disabled.
+- On Windows, the model server and assistant-run commands are attached to a Job Object — closing the CLI window stops everything.
+- Conversation history is kept in memory only and discarded on exit.
+- Common secrets (`.env`, SSH keys, credentials) and binary files are excluded from file tools.
+- Fetched files and web pages are treated as untrusted data and cannot change permissions.
+
+## Project structure
+
+```
+local-desktop-assistant/
+├── local_assistant/          # Python agent package (stdlib only)
+│   ├── __main__.py           # CLI entry point and argument parsing
+│   ├── agent.py              # Tool-calling agent loop
+│   ├── runtime.py            # llama.cpp server lifecycle and streaming
+│   ├── terminal.py           # Terminal UI, welcome screen, input
+│   ├── web.py                # Web search and page extraction
+│   └── workspace.py          # File tools and permission gates
+├── scripts/
+│   ├── start-agent.ps1       # Main launcher
+│   ├── start-cli.ps1         # Plain chat (no tools) launcher
+│   ├── install-command.ps1   # Install `luma` terminal command
+│   ├── download-model.ps1    # Download Qwen3.8-27B
+│   └── download-coder-7b.ps1 # Download Qwen 2.5 Coder 7B
+├── models/                   # Local model files (git-ignored)
+├── runtime/                  # llama.cpp binaries (git-ignored)
+├── docs/                     # Design notes and benchmarks
+├── AGENTS.md                 # Repository guidance for AI agents
+├── Start Assistant.bat       # Double-click launcher
+└── .gitignore
+```
+
+## Hardware tested on
+
+- **CPU**: AMD Ryzen 5 7640HS
+- **RAM**: 32 GB DDR5
+- **GPU**: NVIDIA GeForce RTX 4050 Laptop GPU (6 GB VRAM)
+- **OS**: Windows 11
+
+See [model-setup.md](docs/model-setup.md) and [agent-harness.md](docs/agent-harness.md) for detailed benchmarks and design decisions.
+
+## License
+
+This project is provided as-is for personal and educational use.

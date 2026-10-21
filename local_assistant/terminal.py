@@ -98,7 +98,13 @@ def restore_terminal_features(state: tuple[Any, Any, int, bool] | None) -> None:
 
 
 def display_model_name(model_file: Path) -> str:
-    return model_file.stem.split("-UD-")[0]
+    stem = model_file.stem
+    if "-UD-" in stem:
+        return stem.split("-UD-")[0]
+    for tag in ("-q4", "-Q4", "-q8", "-Q8", "-f16", "-F16"):
+        if tag in stem:
+            return stem.split(tag)[0]
+    return stem
 
 
 def print_welcome(workspace: Path, model_file: Path, context_length: int, web_mode: bool) -> None:

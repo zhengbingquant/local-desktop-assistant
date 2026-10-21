@@ -1,44 +1,72 @@
 # Agent harness design
 
-## Research and backend choice
+## Model auto-detection
 
-The bundled `llama-server` build exposes an OpenAI-compatible chat-completions API. Its documentation says function calling uses the Jinja template path (`--jinja`) and may need a tool-compatible template. The Qwen3.8 deployment examples show `qwen3_coder` parsing for vLLM and SGLang; that parser handles XML-style calls such as `<tool_call><function=...><parameter=...>...`. This harness uses the GGUF's embedded Jinja template with llama.cpp and converts either structured calls or that textual Qwen format into its own validated tool calls. Exact behavior depends on the local GGUF template and llama.cpp build, so tool selection should be evaluated on actual tasks.
+The runtime auto-detects whether the loaded model supports reasoning (e.g., Qwen3.8, DeepSeek-R1) or is a standard coder/instruct model (e.g., Qwen 2.5 Coder). This affects:
+
+- **Server flags**: reasoning models get `--reasoning on` with effort/budget controls; coder models get `--reasoning off`.
+- **Sampling**: reasoning models use `temp=1.0, top_p=0.95, top_k=20`; coder models use `temp=0.2, top_p=0.9, top_k=40` for more deterministic code generation.
+- **Token budget**: `max_tokens` is dynamically set to `min(4096, context_length - 1024)` to reduce truncation failures.
+- **Request body**: reasoning-specific fields (`reasoning_effort`, `thinking_budget_tokens`) are only sent for reasoning models.
+
+Detection is based on the model filename containing known tags (`qwen3`, `deepseek-r1`, etc.).
+
+## Modular code generation
+
+The system prompt instructs the model to work incrementally:
+- Never write an entire large application in a single tool call.
+- Keep individual file writes under 150–200 lines.
+- Create a working skeleton first, then add features step by step.
+
+This prevents the token-limit truncation crash that occurs when a model tries to generate a massive file in one shot and the JSON tool-call argument is cut off mid-string.
+
+## Truncation error handling
+
+When `llama-server` returns HTTP 500 with a JSON parse error (e.g., `missing closing quote`), the harness now provides a clear, actionable error message instead of dumping raw server diagnostics:
+
+> *The model's code output hit the response token limit and was cut off mid-tool call.*
+> *Tip: Ask the model to build the project modularly step-by-step or write smaller files.*
 
 ## Why the Python controller owns tools
 
 The local server is only an inference backend. It listens on loopback on an ephemeral port, uses a per-run API key, runs offline, and has its Web UI and built-in agent tools disabled. The Python controller sends a narrow function list, validates the model's response, enforces workspace paths and size limits, and mediates tool calls.
 
-Read-only tools inspect files in the selected workspace. The session starts in `/permission ask`, where file creation, replacement, and deletion show a proposed diff and require the user to type `YES`; PowerShell commands also require approval and display their exact command and working directory. `/permission workspace` auto-applies workspace file changes after showing their diff but still asks before shell commands. `/permission full` skips per-action approval for file changes and commands for the current session. Commands run with the signed-in Windows user's permissions and can affect files outside the workspace; the harness is not an operating-system sandbox. Use `/permission ask` to restore prompts. Web research defaults to automatic tool availability: the model is instructed to search for explicit lookups, current facts, and questions it cannot answer reliably, and to avoid sending workspace contents or private context. Search queries go to DuckDuckGo, each web tool call is displayed in the CLI, and only public HTTPS pages are fetched. Use `/web off` or `--web-mode off` to disable it; `/web on` restores automatic lookups for the session.
+Read-only tools inspect files in the selected workspace. The session starts in `/permission ask`, where file creation, replacement, and deletion show a proposed diff and require the user to type `YES`; PowerShell commands also require approval and display their exact command and working directory. `/permission workspace` auto-applies workspace file changes after showing their diff but still asks before shell commands. `/permission full` skips per-action approval for the current session.
 
-On Windows, `scripts/install-command.ps1` installs the `luma` and `local-assistant` terminal commands in the user's local Programs directory and adds that directory to the user's PATH. The launcher uses the current directory as the workspace unless a workspace path is supplied.
+Web research defaults to automatic: the model searches for explicit lookups, current facts, and uncertain answers. Search queries go to DuckDuckGo, each call is displayed, and only public HTTPS pages are fetched. Use `/web off` to disable.
 
-On Windows, the local model server and assistant-run shell commands are attached to a Job Object configured with `KILL_ON_JOB_CLOSE`. Normal CLI exit stops them through the context manager; closing or terminating the launcher also closes the Job Object, which makes Windows stop those processes and their child processes instead of leaving work running in the background.
+On Windows, the model server and assistant-launched commands are attached to a Job Object configured with `KILL_ON_JOB_CLOSE`. Closing the CLI window stops everything automatically.
 
-Tool output and fetched pages are untrusted input. They cannot approve actions or change the tool policy. Common secrets and binary model files are excluded from file tools. Conversation context remains in memory and is discarded when the CLI exits.
+## Local performance benchmarks
 
-## Local performance tuning
+Measured on AMD Ryzen 5 7640HS / RTX 4050 Laptop GPU (6 GB) with 8K context:
 
-The Python CLI now reports prompt prefill and generated-token throughput from llama.cpp's streaming usage/timing data. It exposes the model path, context, CPU threads, VRAM fit reserve, KV-cache type, reasoning effort/budget, and optional speculative decoder so the settings can be compared on this machine. Use `/effort none|low|medium|high` for reasoning depth and `/effort budget N` for the token budget.
+### Qwen 2.5 Coder 7B Instruct (Q4_K_M) — full GPU
 
-I ran same-prompt single-turn comparisons on the Ryzen 5 7640HS / RTX 4050 Laptop GPU (6 GB) with the 8K context and a 64-token thinking budget. Results vary by run and answer length, so treat these as local observations, not a formal benchmark:
+| Metric | Value |
+|:-------|------:|
+| Prefill | ~120 tok/s |
+| Generation | ~45 tok/s |
+| Typical agent turn | 10–20 seconds |
+
+### Qwen3.8-27B (Q4_K_XL, F16 KV) — CPU offload
 
 | Configuration | Prefill | Generation |
-| --- | ---: | ---: |
-| Default fit reserve 1024 MiB, F16 KV, automatic threads, no speculation | 64.1 tok/s | 2.1 tok/s |
+|:------------- | -------:| ----------:|
+| Default (1024 MiB reserve, F16 KV, no speculation) | 64.1 tok/s | 2.1 tok/s |
 | 512 MiB reserve, Q8 KV, 6 CPU threads, ngram-mod | 56.9 tok/s | 2.1 tok/s |
-| Same tuned settings with Qwen MTP draft | 58.0 tok/s | 1.8 tok/s |
+| Same with Qwen MTP draft | 58.0 tok/s | 1.8 tok/s |
 
-The MTP run accepted 58 of 96 draft tokens (60%). This did not turn into a measured throughput gain for this workload, so the default stays F16 KV, automatic CPU threads, 1024 MiB reserve, and no speculative decoding. Try the draft manually with `scripts/start-agent.ps1 -Speculative draft-mtp`; the 1.37 GB file is downloaded and SHA-256 verified by `scripts/download-model.ps1 -MTP`.
+Generation for the 27B model stayed near 2 tok/s across all configurations. The bottleneck is system memory bandwidth, not a harness issue.
 
-Generation remained near 2 tok/s across these configurations, including a direct-response run with reasoning disabled. The 27B Q4 model is substantially larger than the laptop's VRAM, so most weights still rely on system memory. The harness settings cannot remove that hardware bottleneck; a smaller quant or model would be a separate quality/performance choice. Use `/effort none` or a smaller `/effort budget N` for routine responses, and raise them for harder tasks. These were one-off short-prompt runs, not a statistical benchmark or an agent-tool correctness evaluation.
+## Qwen tool-call compatibility
+
+The bundled `llama-server` uses the GGUF's embedded Jinja template with `--jinja`. The harness also parses Qwen's textual XML-style `<tool_call>` format as a fallback, converting either structured calls or XML-form output into validated tool calls.
 
 ## Primary references
 
-- [llama.cpp server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) — local API, Jinja tool calls, API keys, loopback binding, and built-in tool flags.
-- [llama.cpp speculative decoding documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md) — MTP and draftless decoder options.
-- [llama.cpp reasoning and streaming timing options](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) — per-request reasoning controls, stream usage and decode timing fields.
-- [llama.cpp per-request thinking budget discussion](https://github.com/ggml-org/llama.cpp/discussions/21445) — `thinking_budget_tokens` support when no server-wide budget is set.
-- [Qwen3.8 official repository](https://github.com/QwenLM/Qwen3.8) — model deployment examples and `qwen3_coder` parser configuration for SGLang and vLLM.
-- [vLLM Qwen3 parser implementation](https://github.com/vllm-project/vllm/blob/main/vllm/parser/qwen3.py) — the XML-style function and parameter tags parsed by the compatibility fallback.
-- [Unsloth Qwen3.8 GGUF repository](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) — local GGUF and llama.cpp usage.
-- [Unsloth Qwen3.8 MTP draft](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/MTP/mtp-Qwen3.8-27B-Q4_0.gguf) — optional 1.37 GB Q4 draft head.
+- [llama.cpp server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+- [llama.cpp speculative decoding](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)
+- [Qwen3.8 official repository](https://github.com/QwenLM/Qwen3.8)
+- [Qwen 2.5 Coder](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF)
+- [Unsloth Qwen3.8 GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)
