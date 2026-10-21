@@ -433,7 +433,7 @@ class WorkspaceTools:
         relative = target.relative_to(self.root).as_posix()
         if not self._show_diff(relative, old_text, proposed):
             raise ToolError("The proposed diff is too large to review in the terminal; no file was changed.")
-        if not self._authorize(f"Apply this change to {relative}? Type YES to approve", scope="workspace"):
+        if not self._authorize(f"Apply this change to {relative}? [y/n]", scope="workspace"):
             return f"User declined the write to {relative}. No file was changed."
 
         target = self._safe_path(relative)
@@ -489,7 +489,7 @@ class WorkspaceTools:
         if not self._show_diff(target.relative_to(self.root).as_posix(), content, ""):
             raise ToolError("The proposed deletion diff is too large to review; no file was changed.")
         relative = target.relative_to(self.root).as_posix()
-        if not self._authorize(f"Delete {relative} ({len(before)} bytes)? Type YES to approve", scope="workspace"):
+        if not self._authorize(f"Delete {relative} ({len(before)} bytes)? [y/n]", scope="workspace"):
             return f"User declined deletion of {relative}. No file was changed."
         target = self._safe_path(relative)
         if not target.is_file() or target.read_bytes() != before:
@@ -510,7 +510,7 @@ class WorkspaceTools:
         print(_terminal_safe(command))
         print(f"\nWorking directory: {self.root}")
         print("This runs with your Windows account's permissions, outside an OS sandbox.")
-        if not self._authorize("Run this command? Type YES to approve", scope="command"):
+        if not self._authorize("Run this command? [y/n]", scope="command"):
             return "User declined to run the command. No command was executed."
 
         args = [shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command]
@@ -614,4 +614,4 @@ def _confirm(prompt: str) -> bool:
     except (EOFError, KeyboardInterrupt):
         print("\nApproval prompt cancelled.")
         return False
-    return answer == "YES"
+    return answer.lower() in {"y", "yes"} or answer == "YES"
