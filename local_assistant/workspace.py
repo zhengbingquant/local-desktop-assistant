@@ -202,29 +202,39 @@ class WorkspaceTools:
             raise ToolError(f"Unknown tool: {name}")
         return handler(**arguments)
 
-    def _safe_path(self, relative: str, *, allow_root: bool = False) -> Path:
-        if not isinstance(relative, str) or not relative.strip():
+    def _safe_path(self, path_str: str, *, allow_root: bool = False) -> Path:
+        if not isinstance(path_str, str) or not path_str.strip():
             if allow_root:
                 return self.root
-            raise ToolError("A non-empty workspace-relative path is required.")
-        requested = Path(relative)
-        if requested.is_absolute() or requested.drive:
-            raise ToolError("Absolute paths are not allowed; use a workspace-relative path.")
-        if os.name == "nt" and any(":" in part for part in requested.parts):
-            raise ToolError("Windows alternate data stream paths are blocked.")
-        target = (self.root / requested).resolve(strict=False)
-        try:
-            target.relative_to(self.root)
-        except ValueError as exc:
-            raise ToolError("That path resolves outside the selected workspace.") from exc
+            raise ToolError("A non-empty path is required.")
+        raw = path_str.strip().strip("'\"")
+        requested = Path(raw)
 
-        cursor = self.root
-        for part in requested.parts:
-            if part in ("", "."):
-                continue
-            cursor = cursor / part
-            if cursor.exists() and _is_reparse_point(cursor):
-                raise ToolError("Symlinks and Windows junctions are not followed by workspace tools.")
+        if requested.is_absolute() or requested.drive:
+            target = requested.resolve(strict=False)
+        elif raw.startswith(("/", "\\")):
+            target = (self.root / raw.lstrip("/\\")).resolve(strict=False)
+        else:
+            target = (self.root / requested).resolve(strict=False)
+
+        if os.name == "nt" and any(":" in part for part in target.parts[1:]):
+            raise ToolError("Windows alternate data stream paths are blocked.")
+
+        if self.permission_mode != "full":
+            try:
+                target.relative_to(self.root)
+            except ValueError as exc:
+                raise ToolError(f"Path '{path_str}' is outside workspace '{self.root}'.") from exc
+
+        if target.is_relative_to(self.root):
+            cursor = self.root
+            for part in target.relative_to(self.root).parts:
+                if part in ("", "."):
+                    continue
+                cursor = cursor / part
+                if cursor.exists() and _is_reparse_point(cursor):
+                    raise ToolError("Symlinks and Windows junctions are not followed by workspace tools.")
+
         return target
 
     def _read_gitignore(self) -> list[str]:
@@ -497,9 +507,38 @@ class WorkspaceTools:
         target.unlink()
         return f"Deleted {relative}."
 
+    def _auto_quote_paths(self, command: str) -> str:
+        paths_to_quote = []
+        for p in (self.root, Path.home()):
+            p_str = str(p)
+            if " " in p_str and p_str not in paths_to_quote:
+                paths_to_quote.append(p_str)
+        for base_path in paths_to_quote:
+            parts = []
+            pos = 0
+            in_quote = None
+            for i, ch in enumerate(command):
+                if ch in ("'", '"'):
+                    if in_quote == ch:
+                        in_quote = None
+                    elif in_quote is None:
+                        in_quote = ch
+                elif in_quote is None and command[i:].startswith(base_path):
+                    end = i + len(base_path)
+                    while end < len(command) and command[end] not in (" ", "\t", "\n", "\r", '"', "'", "|", ";", "&"):
+                        end += 1
+                    unquoted_path = command[i:end]
+                    parts.append(command[pos:i])
+                    parts.append(f"'{unquoted_path}'")
+                    pos = end
+            parts.append(command[pos:])
+            command = "".join(parts)
+        return command
+
     def run_command(self, command: str, timeout_seconds: int = 120) -> str:
         if not isinstance(command, str) or not command.strip():
             raise ToolError("Command cannot be empty.")
+        command = self._auto_quote_paths(command)
         if len(command) > 5000:
             raise ToolError("Command is too long to review safely.")
         timeout_seconds = _bounded_int(timeout_seconds, 1, 300, "timeout_seconds")
