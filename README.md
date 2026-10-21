@@ -2,6 +2,8 @@
 
 A local coding-agent CLI for Qwen3.8-27B. The model runs through a local CUDA-enabled build of `llama.cpp`; a small Python controller supplies workspace tools and mediates writes and commands. No cloud model or Ollama is required.
 
+![Local Assistant CLI](docs/assets/local-assistant-terminal.png)
+
 ## Start
 
 - Install a terminal command once: `powershell -ExecutionPolicy Bypass -File .\scripts\install-command.ps1`. Reopen the terminal, then type `luma` (or `local-assistant`) from the folder you want the assistant to work in.
