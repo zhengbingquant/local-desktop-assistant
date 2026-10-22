@@ -35,23 +35,32 @@ _LOGO = (
 # ── Slash command definitions ────────────────────────────────────────
 # Clean root commands (what appears when typing '/')
 _COMMAND_GROUPS = (
-    ("Session", (
-        ("/new",                "Start a fresh conversation (/clear)",       "⟳"),
-        ("/workspace",          "Show the active workspace folder",          "📁"),
-        ("/model",              "Show active model and context info",        "🤖"),
-        ("/cls",                "Clear the terminal screen",                 "🧹"),
-        ("/help",               "Show available commands",                   "?"),
-        ("/exit",               "Stop the assistant (/quit)",                "⏻"),
-    )),
-    ("Settings", (
-        ("/permission",         "Switch permission mode (ask / workspace / full)", "🔒"),
+    ("Model & Reasoning", (
+        ("/model",              "Switch active model or view model details", "🤖"),
+        ("/think",              "Toggle thinking process display (show / hide)", "💭"),
         ("/effort",             "Set reasoning effort or thinking budget",         "🧠"),
+    )),
+    ("Environment", (
+        ("/workspace",          "View or switch active workspace folder",          "📁"),
+        ("/permission",         "Switch permission mode (ask / workspace / full)", "🔒"),
         ("/web",                "Configure web research (auto / off)",            "🌐"),
+    )),
+    ("Session & Context", (
+        ("/context",            "Show context window usage and details",           "📊"),
+        ("/compact",            "Compact conversation history to save tokens",     "🗜️"),
+        ("/new",                "Start a fresh conversation (/clear)",             "⟳"),
+        ("/cls",                "Clear the terminal screen",                       "🧹"),
+        ("/help",               "Show available commands",                         "?"),
+        ("/exit",               "Stop the assistant (/quit)",                      "⏻"),
     )),
 )
 
-# Extended completions for direct typing (e.g. /permission ask)
+# Extended completions for direct typing (e.g. /permission ask, /model 7b)
 _EXTENDED_COMPLETIONS = (
+    ("/model 7b", "Switch to Qwen 2.5 Coder 7B (fast coding, 100% RTX 4050 VRAM)"),
+    ("/model 27b", "Switch to Qwen 3.8 27B (deep reasoning, GPU + AVX-512 CPU)"),
+    ("/think show", "Stream thinking and reasoning live in dimmed text"),
+    ("/think hide", "Hide thinking process (show 'Thinking...' status only)"),
     ("/permission ask", "Ask before every file change and command"),
     ("/permission workspace", "Auto-apply workspace file edits; ask for commands"),
     ("/permission full", "Run file changes and commands without per-action approval"),
@@ -62,6 +71,7 @@ _EXTENDED_COMPLETIONS = (
     ("/effort budget ", "Set token budget, e.g. /effort budget 512"),
     ("/web auto", "Enable automatic web lookups"),
     ("/web off", "Disable web — fully offline session"),
+    ("/workspace ", "Switch active workspace folder, e.g. /workspace C:\\project"),
 )
 
 # Flattened for autocomplete matching
@@ -128,6 +138,10 @@ def restore_terminal_features(state: tuple[Any, Any, int, bool] | None) -> None:
         if changed:
             kernel32.SetConsoleMode(handle, original_mode)
     _VT_READY = False
+
+
+def is_color_enabled() -> bool:
+    return sys.stdout.isatty() and (_VT_READY or os.name != "nt")
 
 
 def display_model_name(model_file: Path) -> str:

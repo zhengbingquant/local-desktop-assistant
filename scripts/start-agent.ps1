@@ -19,6 +19,8 @@ param(
     [string]$ReasoningEffort = 'medium',
     [ValidateRange(0, 8192)]
     [int]$ThinkingBudget = 512,
+    [ValidateSet('show', 'hide')]
+    [string]$ThinkingDisplay = 'show',
     [switch]$EnableWeb,
     [switch]$DisableWeb
 )
@@ -105,6 +107,7 @@ $arguments = @(
     '--speculative', $effectiveSpeculative,
     '--reasoning-effort', $ReasoningEffort,
     '--thinking-budget', "$ThinkingBudget",
+    '--thinking-display', $ThinkingDisplay,
     '--web-mode', $(if ($DisableWeb) { 'off' } else { 'auto' })
 )
 if ($effectiveSpeculative -eq 'draft-mtp') {

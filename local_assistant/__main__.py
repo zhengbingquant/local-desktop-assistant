@@ -64,6 +64,12 @@ def main() -> int:
         default=512,
         help="maximum reasoning tokens per model response (default: 512; 0 disables the budget)",
     )
+    parser.add_argument(
+        "--thinking-display",
+        choices=("show", "hide"),
+        default="show",
+        help="display or hide reasoning tokens in the terminal (default: show)",
+    )
     args = parser.parse_args()
 
     workspace = args.workspace.expanduser().resolve()
@@ -111,6 +117,7 @@ def main() -> int:
         reasoning_effort=args.reasoning_effort,
         thinking_budget_tokens=args.thinking_budget,
         draft_model_file=draft_model_file,
+        thinking_display=args.thinking_display,
     )
 
 

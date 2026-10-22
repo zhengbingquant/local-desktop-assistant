@@ -309,6 +309,7 @@ class LocalModelServer:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         on_text: Callable[[str], None],
+        on_thought: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         is_reasoning = any(tag in self.model_file.name.lower() for tag in ("qwen3", "deepseek-r1", "reasoning", "thinking"))
         max_tokens_val = max(2048, min(4096, self.context_length - 1024))
@@ -349,7 +350,8 @@ class LocalModelServer:
         finish_reason: str | None = None
         usage: dict[str, Any] = {}
         timings: dict[str, Any] = {}
-        visible = False
+        thought_visible = False
+        content_visible = False
         print("Thinking...", end="", flush=True)
 
         try:
@@ -378,18 +380,25 @@ class LocalModelServer:
                         continue
                     finish_reason = choices[0].get("finish_reason") or finish_reason
                     delta = choices[0].get("delta") or {}
-                    text = delta.get("content")
-                    if isinstance(text, str) and text:
-                        if not visible:
-                            print("\r" + " " * 16 + "\r", end="", flush=True)
-                            visible = True
-                        safe = _terminal_safe(text)
-                        content.append(safe)
-                        on_text(safe)
 
                     thought = delta.get("reasoning_content", delta.get("reasoning"))
                     if isinstance(thought, str) and thought:
                         reasoning.append(thought)
+                        if on_thought is not None:
+                            if not thought_visible:
+                                print("\r" + " " * 16 + "\r", end="", flush=True)
+                                thought_visible = True
+                            on_thought(thought)
+
+                    text = delta.get("content")
+                    if isinstance(text, str) and text:
+                        if not content_visible:
+                            if not thought_visible:
+                                print("\r" + " " * 16 + "\r", end="", flush=True)
+                            content_visible = True
+                        safe = _terminal_safe(text)
+                        content.append(safe)
+                        on_text(safe)
 
                     for fragment in delta.get("tool_calls") or []:
                         index = int(fragment.get("index", 0))
@@ -418,7 +427,7 @@ class LocalModelServer:
         except (OSError, urllib.error.URLError) as exc:
             raise ModelError(f"Could not get a response from the local model: {exc}") from exc
         finally:
-            if not visible:
+            if not content_visible and not thought_visible:
                 print("\r" + " " * 16 + "\r", end="", flush=True)
 
         result: dict[str, Any] = {"role": "assistant", "content": "".join(content)}

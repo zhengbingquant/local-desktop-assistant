@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from .runtime import LocalModelServer, ModelError, _terminal_safe
 from .terminal import (
     display_model_name,
     enable_terminal_features,
+    is_color_enabled,
     print_command_menu,
     print_welcome,
     read_prompt_line,
@@ -102,12 +104,14 @@ class LocalAgent:
         model: LocalModelServer,
         workspace: Path,
         allow_web: bool = True,
+        thinking_display: str = "show",
     ) -> None:
         self.model = model
         self.workspace = workspace.resolve()
         self.tools = WorkspaceTools(self.workspace, process_attacher=self.model.attach_process)
         self.web_tools = WebTools()
         self.web_enabled = allow_web
+        self.thinking_display = thinking_display
         self.system_prompt = self._build_system_prompt()
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
 
@@ -202,6 +206,133 @@ class LocalAgent:
         self.model.thinking_budget_tokens = budget
         print(f"Thinking budget set to {budget} tokens for this session.")
 
+    def set_thinking_display(self, mode: str) -> None:
+        mode_lower = mode.strip().lower()
+        if mode_lower in {"show", "on", "visible", "true", "1"}:
+            self.thinking_display = "show"
+            print("Thinking display: show · model reasoning process will stream in dimmed text.")
+        elif mode_lower in {"hide", "off", "hidden", "false", "0"}:
+            self.thinking_display = "hide"
+            print("Thinking display: hide · model reasoning process is hidden; only final answer is shown.")
+        else:
+            print("Invalid thinking display mode. Use /think show or /think hide.")
+
+    def switch_workspace(self, new_workspace: Path) -> None:
+        resolved = new_workspace.expanduser().resolve()
+        if not resolved.is_dir():
+            print(f"Workspace path is not a directory: {resolved}")
+            return
+        self.workspace = resolved
+        self.tools.root = resolved
+        self.system_prompt = self._build_system_prompt()
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = self.system_prompt
+        print(f"Active workspace switched to: {self.workspace}")
+
+    def switch_model(self, target: str | Path) -> bool:
+        project_root = Path(__file__).resolve().parents[1]
+        target_str = str(target).strip()
+        target_lower = target_str.lower()
+        coder_7b_file = project_root / "models" / "Qwen2.5-Coder-7B" / "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+        default_27b_file = project_root / "models" / "Qwen3.8-27B-HF" / "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+
+        target_file: Path | None = None
+        if target_lower in {"7b", "coder", "qwen7b", "qwen2.5", "qwen2.5-coder"}:
+            target_file = coder_7b_file
+        elif target_lower in {"27b", "qwen27b", "qwen3", "qwen3.8", "3.8"}:
+            target_file = default_27b_file
+        else:
+            candidate = Path(target_str).expanduser().resolve()
+            if candidate.is_file():
+                target_file = candidate
+            else:
+                models_dir = project_root / "models"
+                if models_dir.is_dir():
+                    for gguf in models_dir.rglob("*.gguf"):
+                        if "mmproj" in gguf.name.lower() or "mtp" in gguf.name.lower():
+                            continue
+                        if target_lower in gguf.name.lower() or target_lower in gguf.stem.lower():
+                            if gguf.stat().st_size > 100 * 1024 * 1024:
+                                target_file = gguf
+                                break
+
+        if target_file is None or not target_file.is_file():
+            print(f"Model not found: {target}")
+            print("Available models: '7b' (Qwen 2.5 Coder 7B), '27b' (Qwen 3.8 27B)")
+            return False
+
+        if target_file.resolve() == self.model.model_file.resolve():
+            print(f"Model {display_model_name(target_file)} is already active.")
+            return True
+
+        old_model = self.model
+        new_name = display_model_name(target_file)
+        old_name = display_model_name(old_model.model_file)
+        print(f"\nSwitching model: {old_name} → {new_name}...")
+        old_model.close()
+        time.sleep(0.5)
+
+        is_27b = "27b" in target_file.name.lower() or "qwen3" in target_file.name.lower()
+        kv_cache_type = "q8_0" if is_27b else "f16"
+        cpu_threads = 6 if is_27b else None
+        reasoning_effort = "medium" if is_27b else "none"
+        thinking_budget_tokens = 512 if is_27b else 0
+
+        new_server = LocalModelServer(
+            server_exe=old_model.server_exe,
+            model_file=target_file,
+            context_length=old_model.context_length,
+            cpu_threads=cpu_threads,
+            batch_threads=old_model.batch_threads,
+            gpu_reserve_mib=old_model.gpu_reserve_mib,
+            kv_cache_type=kv_cache_type,
+            speculative="none",
+            reasoning_effort=reasoning_effort,
+            thinking_budget_tokens=thinking_budget_tokens,
+        )
+
+        try:
+            new_server.__enter__()
+            self.model = new_server
+            self.tools.process_attacher = self.model.attach_process
+            self.system_prompt = self._build_system_prompt()
+            if self.messages and self.messages[0].get("role") == "system":
+                self.messages[0]["content"] = self.system_prompt
+            print(f"✓ Active model successfully switched to: {new_name}\n")
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetConsoleTitleW(f"Local Assistant | {new_name}")
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            print(f"\nFailed to load {new_name}: {exc}")
+            print(f"Restoring previous model ({old_name})...")
+            try:
+                old_model.__enter__()
+                self.model = old_model
+                self.tools.process_attacher = self.model.attach_process
+                print(f"Restored {old_name}.")
+            except Exception as restore_exc:
+                print(f"Could not restore previous model: {restore_exc}")
+            return False
+
+    def compact_history(self) -> int:
+        if len(self.messages) <= 3:
+            return len(self.messages)
+        system_msg = self.messages[0]
+        recent_msgs = self.messages[-4:]
+        compact_notice = {
+            "role": "user",
+            "content": "[Previous conversation history compacted to conserve context window. Continuing with recent context.]",
+        }
+        compact_ack = {
+            "role": "assistant",
+            "content": "Context compacted. I am ready to continue with your current task.",
+        }
+        self.messages = [system_msg, compact_notice, compact_ack] + recent_msgs
+        return len(self.messages)
+
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt}]
 
@@ -215,8 +346,49 @@ class LocalAgent:
         allowed_tools = {schema["function"]["name"] for schema in self.tool_schemas() if "function" in schema}
 
         for _ in range(MAX_TOOL_ROUNDS):
-            printer = _StreamPrinter(allowed_tools=allowed_tools)
-            response = self.model.stream_chat(self.messages, self.tool_schemas(), printer.feed)
+            printer = _StreamPrinter(
+                allowed_tools=allowed_tools,
+                show_thinking=(self.thinking_display == "show"),
+            )
+            thinking_header_printed = False
+
+            def handle_thought(chunk: str) -> None:
+                nonlocal thinking_header_printed
+                color = is_color_enabled()
+                cyan = "\x1b[96m" if color else ""
+                muted = "\x1b[90m" if color else ""
+                reset = "\x1b[0m" if color else ""
+                if not thinking_header_printed:
+                    sys.stdout.write(f"\n{cyan}┌─ Thinking Process{reset}\n{muted}")
+                    sys.stdout.flush()
+                    thinking_header_printed = True
+                sys.stdout.write(_terminal_safe(chunk))
+                sys.stdout.flush()
+
+            def handle_text(chunk: str) -> None:
+                nonlocal thinking_header_printed
+                if thinking_header_printed:
+                    color = is_color_enabled()
+                    muted = "\x1b[90m" if color else ""
+                    reset = "\x1b[0m" if color else ""
+                    sys.stdout.write(f"{reset}\n{muted}└────────────────────────────────────────{reset}\n\n")
+                    sys.stdout.flush()
+                    thinking_header_printed = False
+                printer.feed(chunk)
+
+            thought_cb = handle_thought if self.thinking_display == "show" else None
+            response = self.model.stream_chat(
+                self.messages,
+                self.tool_schemas(),
+                handle_text,
+                on_thought=thought_cb,
+            )
+            if thinking_header_printed:
+                color = is_color_enabled()
+                muted = "\x1b[90m" if color else ""
+                reset = "\x1b[0m" if color else ""
+                sys.stdout.write(f"{reset}\n{muted}└────────────────────────────────────────{reset}\n\n")
+                sys.stdout.flush()
             printer.finish()
             if printer.visible:
                 print()
@@ -251,8 +423,20 @@ class LocalAgent:
 
             if tool_count >= MAX_TOOL_CALLS:
                 print("\nTool-call limit reached; asking the model for a summary.")
-                printer = _StreamPrinter(allowed_tools=allowed_tools)
-                final = self.model.stream_chat(self.messages, [], printer.feed)
+                printer = _StreamPrinter(allowed_tools=allowed_tools, show_thinking=(self.thinking_display == "show"))
+                thinking_header_printed = False
+                final = self.model.stream_chat(
+                    self.messages,
+                    [],
+                    handle_text,
+                    on_thought=thought_cb,
+                )
+                if thinking_header_printed:
+                    color = is_color_enabled()
+                    muted = "\x1b[90m" if color else ""
+                    reset = "\x1b[0m" if color else ""
+                    sys.stdout.write(f"{reset}\n{muted}└────────────────────────────────────────{reset}\n\n")
+                    sys.stdout.flush()
                 printer.finish()
                 if printer.visible:
                     print()
@@ -581,10 +765,12 @@ def _read_legacy_qwen_tool_calls(
 class _StreamPrinter:
     """Stream user-facing text while suppressing raw tool-call markup."""
 
-    def __init__(self, allowed_tools: set[str] | None = None) -> None:
+    def __init__(self, allowed_tools: set[str] | None = None, show_thinking: bool = True) -> None:
         self.allowed_tools = allowed_tools or KNOWN_TOOL_NAMES
+        self.show_thinking = show_thinking
         self.buffer = ""
         self.suppressing = False
+        self.in_think = False
         self.closer = ""
         self.visible = False
 
@@ -593,6 +779,11 @@ class _StreamPrinter:
         self._drain(final=False)
 
     def finish(self) -> None:
+        if self.in_think:
+            self._emit_thought(self.buffer)
+            self._finish_thought()
+            self.buffer = ""
+            self.in_think = False
         self._drain(final=True)
 
     def _emit(self, value: str) -> None:
@@ -601,8 +792,49 @@ class _StreamPrinter:
             sys.stdout.flush()
             self.visible = True
 
+    def _start_thought(self) -> None:
+        color = is_color_enabled()
+        cyan = "\x1b[96m" if color else ""
+        muted = "\x1b[90m" if color else ""
+        reset = "\x1b[0m" if color else ""
+        sys.stdout.write(f"\n{cyan}┌─ Thinking Process{reset}\n{muted}")
+        sys.stdout.flush()
+
+    def _emit_thought(self, value: str) -> None:
+        if value:
+            sys.stdout.write(_terminal_safe(value))
+            sys.stdout.flush()
+
+    def _finish_thought(self) -> None:
+        color = is_color_enabled()
+        muted = "\x1b[90m" if color else ""
+        reset = "\x1b[0m" if color else ""
+        sys.stdout.write(f"{reset}\n{muted}└────────────────────────────────────────{reset}\n\n")
+        sys.stdout.flush()
+
     def _drain(self, final: bool) -> None:
         while self.buffer:
+            if self.in_think:
+                end = self.buffer.find("</think>")
+                if end >= 0:
+                    think_text = self.buffer[:end]
+                    self._emit_thought(think_text)
+                    self._finish_thought()
+                    self.buffer = self.buffer[end + len("</think>"):]
+                    self.in_think = False
+                    continue
+                if final:
+                    self._emit_thought(self.buffer)
+                    self._finish_thought()
+                    self.buffer = ""
+                    self.in_think = False
+                    return
+                keep = len("</think>") - 1
+                if len(self.buffer) > keep:
+                    self._emit_thought(self.buffer[:-keep])
+                    self.buffer = self.buffer[-keep:]
+                return
+
             if self.suppressing:
                 end = self.buffer.find(self.closer)
                 if end >= 0:
@@ -617,6 +849,18 @@ class _StreamPrinter:
                 if keep > 0 and len(self.buffer) > keep:
                     self.buffer = self.buffer[-keep:]
                 return
+
+            idx_think = self.buffer.find("<think>")
+            if idx_think >= 0:
+                self._emit(self.buffer[:idx_think])
+                self.buffer = self.buffer[idx_think + len("<think>"):]
+                if self.show_thinking:
+                    self._start_thought()
+                    self.in_think = True
+                else:
+                    self.suppressing = True
+                    self.closer = "</think>"
+                continue
 
             idx_xml = self.buffer.find("<tool_call>")
             if idx_xml >= 0:
@@ -662,7 +906,7 @@ class _StreamPrinter:
                 self.buffer = ""
                 return
 
-            keep = 3
+            keep = 8
             if len(self.buffer) > keep:
                 self._emit(self.buffer[:-keep])
                 self.buffer = self.buffer[-keep:]
@@ -698,180 +942,269 @@ def interactive_cli(
     model: LocalModelServer,
     workspace: Path,
     allow_web: bool = True,
+    thinking_display: str = "show",
 ) -> None:
-    agent = LocalAgent(model, workspace, allow_web=allow_web)
+    agent = LocalAgent(model, workspace, allow_web=allow_web, thinking_display=thinking_display)
     print("Ready. Type / to browse commands · Ctrl+C interrupts the current turn.\n")
 
-    while True:
-        try:
-            user_text = read_prompt_line().strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nStopping the assistant...")
-            return
-        if not user_text:
-            continue
-        command = user_text.lower()
-        if command in {"/exit", "/quit"}:
-            print("Stopping the assistant...")
-            return
-        if command in {"/", "/help"}:
-            print_command_menu()
-            continue
-        if command in {"/new", "/clear"}:
-            agent.reset()
-            print("Started a fresh conversation.\n")
-            continue
-        if command == "/workspace":
-            print(f"Workspace: {agent.workspace}\n")
-            continue
-        if command == "/model":
-            model_name = display_model_name(agent.model.model_file)
-            print(f"Active model : {model_name}")
-            print(f"Model file   : {agent.model.model_file}")
-            print(f"Context size : {agent.model.context_length // 1024}K tokens")
-            print(f"Reasoning    : {agent.model.reasoning_effort} (budget: {agent.model.thinking_budget_tokens})")
-            project_root = Path(__file__).resolve().parents[1]
-            models_dir = project_root / "models"
-            available = []
-            if models_dir.is_dir():
-                for gguf in models_dir.rglob("*.gguf"):
-                    if "mmproj" not in gguf.name.lower() and "mtp" not in gguf.name.lower():
-                        if gguf.resolve() != agent.model.model_file.resolve():
-                            available.append(gguf)
-            if available:
-                print("\nOther installed models on this laptop:")
-                for m in available:
-                    size_gb = m.stat().st_size / (1024**3)
-                    print(f"  • {display_model_name(m):<28} ({size_gb:.1f} GB)")
-                print("\nTo switch model, restart with:")
-                print(f'  luma -ModelPath "{available[0]}"')
-            print()
-            continue
-        if command in {"/cls", "/clear-screen"}:
-            sys.stdout.write("\x1b[2J\x1b[H")
-            sys.stdout.flush()
-            continue
-        if command in {"/permission", "/permissions"}:
-            selected = select_menu(
-                "Permission Mode",
-                [
-                    ("ask", "ask", "Ask before every file change and command (default)"),
-                    ("workspace", "workspace", "Auto-apply workspace file edits; ask before commands"),
-                    ("full", "full", "Run file changes and commands without approval"),
-                ],
-                current=agent.tools.permission_mode,
-            )
-            if selected:
-                agent.set_permission_mode(selected)
-            else:
-                agent.show_permission_mode()
-            print()
-            continue
-        if command.startswith("/permission "):
-            pieces = command.split()
-            if len(pieces) == 2:
-                agent.set_permission_mode(pieces[1])
-            else:
-                print("Usage: /permission ask|workspace|full")
-            print()
-            continue
-        if command == "/web":
-            selected = select_menu(
-                "Web Research",
-                [
-                    ("auto", "auto", "Automatic DuckDuckGo lookups when facts or searches needed"),
-                    ("off", "off", "Disable web research — fully offline session"),
-                ],
-                current="auto" if agent.web_enabled else "off",
-            )
-            if selected == "auto":
+    try:
+        while True:
+            try:
+                user_text = read_prompt_line().strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nStopping the assistant...")
+                return
+            if not user_text:
+                continue
+            command = user_text.lower()
+            if command in {"/exit", "/quit"}:
+                print("Stopping the assistant...")
+                return
+            if command in {"/", "/help"}:
+                print_command_menu()
+                continue
+            if command in {"/new", "/clear"}:
+                agent.reset()
+                print("Started a fresh conversation.\n")
+                continue
+            if command == "/workspace":
+                print(f"Active workspace: {agent.workspace}")
+                print("To switch folder, type: /workspace <path> (e.g. /workspace C:\\path\\to\\project)\n")
+                continue
+            if command.startswith("/workspace "):
+                new_path_str = user_text[len("/workspace"):].strip()
+                if (new_path_str.startswith('"') and new_path_str.endswith('"')) or (new_path_str.startswith("'") and new_path_str.endswith("'")):
+                    new_path_str = new_path_str[1:-1]
+                new_path = Path(new_path_str).expanduser().resolve()
+                if not new_path.exists():
+                    print(f"Directory does not exist: {new_path}")
+                    try:
+                        create = input("Create this directory? (y/n): ").strip().lower()
+                        if create in ("y", "yes"):
+                            new_path.mkdir(parents=True, exist_ok=True)
+                        else:
+                            print("Workspace switch cancelled.\n")
+                            continue
+                    except (EOFError, KeyboardInterrupt):
+                        print("\nWorkspace switch cancelled.\n")
+                        continue
+                if new_path.is_dir():
+                    agent.switch_workspace(new_path)
+                    print()
+                else:
+                    print(f"Path is not a directory: {new_path}\n")
+                continue
+            if command == "/model":
+                project_root = Path(__file__).resolve().parents[1]
+                models_dir = project_root / "models"
+                available_options: list[tuple[str, str, str]] = []
+
+                coder_7b_file = models_dir / "Qwen2.5-Coder-7B" / "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+                default_27b_file = models_dir / "Qwen3.8-27B-HF" / "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+
+                if coder_7b_file.is_file():
+                    available_options.append(("7b", "Qwen 2.5 Coder 7B", "Fast coding (100% RTX 4050 VRAM · 35-45 tok/s)"))
+                if default_27b_file.is_file():
+                    available_options.append(("27b", "Qwen 3.8 27B", "Deep reasoning (16 layers GPU + Zen 4 AVX-512 CPU · 2.4 tok/s)"))
+
+                if models_dir.is_dir():
+                    for gguf in models_dir.rglob("*.gguf"):
+                        if "mmproj" in gguf.name.lower() or "mtp" in gguf.name.lower():
+                            continue
+                        if gguf.stat().st_size < 100 * 1024 * 1024:
+                            continue
+                        if gguf.resolve() not in (coder_7b_file.resolve(), default_27b_file.resolve()):
+                            size_gb = gguf.stat().st_size / (1024**3)
+                            name = display_model_name(gguf)
+                            available_options.append((str(gguf), name, f"Custom model ({size_gb:.1f} GB)"))
+
+                active_stem = agent.model.model_file.name.lower()
+                current_id = "27b" if ("27b" in active_stem or "qwen3" in active_stem) else ("7b" if "7b" in active_stem else str(agent.model.model_file))
+
+                selected = select_menu("Select Local Model", available_options, current=current_id)
+                if selected:
+                    agent.switch_model(selected)
+                else:
+                    model_name = display_model_name(agent.model.model_file)
+                    print(f"Active model : {model_name}")
+                    print(f"Model file   : {agent.model.model_file}")
+                    print(f"Context size : {agent.model.context_length // 1024}K tokens")
+                    print(f"Reasoning    : {agent.model.reasoning_effort} (budget: {agent.model.thinking_budget_tokens})")
+                    print("Switch anytime with /model, /model 7b, or /model 27b.\n")
+                continue
+            if command.startswith("/model "):
+                target_arg = user_text[len("/model"):].strip()
+                agent.switch_model(target_arg)
+                continue
+            if command in {"/think", "/thinking", "/thought"}:
+                selected = select_menu(
+                    "Thinking Process Display",
+                    [
+                        ("show", "show", "Stream thinking and reasoning live in dimmed text"),
+                        ("hide", "hide", "Hide thinking process (show 'Thinking...' status only)"),
+                    ],
+                    current=agent.thinking_display,
+                )
+                if selected:
+                    agent.set_thinking_display(selected)
+                else:
+                    print(f"Thinking display is currently: {agent.thinking_display}\n")
+                continue
+            if command.startswith(("/think ", "/thinking ")):
+                prefix_len = len("/thinking ") if command.startswith("/thinking ") else len("/think ")
+                arg = user_text[prefix_len:].strip()
+                agent.set_thinking_display(arg)
+                print()
+                continue
+            if command in {"/context", "/tokens"}:
+                total_chars = sum(len(m.get("content") or "") for m in agent.messages)
+                approx_tokens = total_chars // 4
+                ctx_limit = agent.model.context_length
+                pct = (approx_tokens / ctx_limit) * 100 if ctx_limit else 0
+                model_name = display_model_name(agent.model.model_file)
+                print(f"\nContext Window Usage:")
+                print(f"  Model         : {model_name}")
+                print(f"  Context limit : {ctx_limit:,} tokens ({ctx_limit // 1024}K)")
+                print(f"  Used (approx) : ~{approx_tokens:,} tokens ({pct:.1f}%)")
+                print(f"  Messages      : {len(agent.messages)} turns in history")
+                print(f"  Thinking mode : {agent.thinking_display}")
+                print(f"  Permission    : {agent.tools.permission_mode}")
+                print(f"  Web research  : {'enabled' if agent.web_enabled else 'off'}")
+                print(f"\nTip: Type /compact to trim older turns, or /new to start a fresh chat.\n")
+                continue
+            if command in {"/compact", "/compress"}:
+                if len(agent.messages) <= 3:
+                    print("Conversation history is already minimal; nothing to compact.\n")
+                    continue
+                count = agent.compact_history()
+                print(f"✓ Compacted conversation history ({count} messages retained in active context).\n")
+                continue
+            if command in {"/cls", "/clear-screen"}:
+                sys.stdout.write("\x1b[2J\x1b[H")
+                sys.stdout.flush()
+                continue
+            if command in {"/permission", "/permissions"}:
+                selected = select_menu(
+                    "Permission Mode",
+                    [
+                        ("ask", "ask", "Ask before every file change and command (default)"),
+                        ("workspace", "workspace", "Auto-apply workspace file edits; ask before commands"),
+                        ("full", "full", "Run file changes and commands without approval"),
+                    ],
+                    current=agent.tools.permission_mode,
+                )
+                if selected:
+                    agent.set_permission_mode(selected)
+                else:
+                    agent.show_permission_mode()
+                print()
+                continue
+            if command.startswith("/permission "):
+                pieces = command.split()
+                if len(pieces) == 2:
+                    agent.set_permission_mode(pieces[1])
+                else:
+                    print("Usage: /permission ask|workspace|full")
+                print()
+                continue
+            if command == "/web":
+                selected = select_menu(
+                    "Web Research",
+                    [
+                        ("auto", "auto", "Automatic DuckDuckGo lookups when facts or searches needed"),
+                        ("off", "off", "Disable web research — fully offline session"),
+                    ],
+                    current="auto" if agent.web_enabled else "off",
+                )
+                if selected == "auto":
+                    agent.set_web_enabled(True)
+                    print()
+                elif selected == "off":
+                    agent.set_web_enabled(False)
+                    print()
+                else:
+                    state = "enabled" if agent.web_enabled else "disabled"
+                    print(f"Web research is currently {state}.\n")
+                continue
+            if command in {"/web auto", "/web on"}:
                 agent.set_web_enabled(True)
                 print()
-            elif selected == "off":
+                continue
+            if command == "/web off":
                 agent.set_web_enabled(False)
                 print()
-            else:
-                state = "enabled" if agent.web_enabled else "disabled"
-                print(f"Web research is currently {state}.\n")
-            continue
-        if command in {"/web auto", "/web on"}:
-            agent.set_web_enabled(True)
-            print()
-            continue
-        if command == "/web off":
-            agent.set_web_enabled(False)
-            print()
-            continue
-        if command == "/effort":
-            selected = select_menu(
-                "Reasoning Effort",
-                [
-                    ("none", "none", "Fast, direct answers — no thinking tokens"),
-                    ("low", "low", "Light reasoning"),
-                    ("medium", "medium", "Balanced reasoning (default)"),
-                    ("high", "high", "Deep reasoning — thorough deliberation"),
-                    ("budget", "budget", f"Custom token budget (current: {agent.model.thinking_budget_tokens})"),
-                ],
-                current=agent.model.reasoning_effort,
-            )
-            if selected == "budget":
-                try:
-                    val = input(f"\nEnter thinking budget in tokens (0-8192, current {agent.model.thinking_budget_tokens}): ").strip()
-                    if val.isdigit():
-                        agent.set_thinking_budget(int(val))
-                    else:
-                        print("Invalid number.")
-                except (EOFError, KeyboardInterrupt):
-                    pass
+                continue
+            if command == "/effort":
+                selected = select_menu(
+                    "Reasoning Effort",
+                    [
+                        ("none", "none", "Fast, direct answers — no thinking tokens"),
+                        ("low", "low", "Light reasoning"),
+                        ("medium", "medium", "Balanced reasoning (default)"),
+                        ("high", "high", "Deep reasoning — thorough deliberation"),
+                        ("budget", "budget", f"Custom token budget (current: {agent.model.thinking_budget_tokens})"),
+                    ],
+                    current=agent.model.reasoning_effort,
+                )
+                if selected == "budget":
+                    try:
+                        val = input(f"\nEnter thinking budget in tokens (0-8192, current {agent.model.thinking_budget_tokens}): ").strip()
+                        if val.isdigit():
+                            agent.set_thinking_budget(int(val))
+                        else:
+                            print("Invalid number.")
+                    except (EOFError, KeyboardInterrupt):
+                        pass
+                    print()
+                elif selected:
+                    agent.set_reasoning_effort(selected)
+                    print()
+                else:
+                    agent.show_effort_settings()
+                    print()
+                continue
+            if command.startswith("/effort "):
+                pieces = command.split()
+                if len(pieces) == 2:
+                    agent.set_reasoning_effort(pieces[1])
+                elif len(pieces) == 3 and pieces[1] == "budget" and pieces[2].isdigit():
+                    agent.set_thinking_budget(int(pieces[2]))
+                else:
+                    print("Usage: /effort none|low|medium|high or /effort budget N")
                 print()
-            elif selected:
-                agent.set_reasoning_effort(selected)
+                continue
+            if command.startswith("/reasoning "):
+                pieces = command.split()
+                if len(pieces) == 2:
+                    agent.set_reasoning_effort(pieces[1])
+                else:
+                    print("Usage: /effort none|low|medium|high")
                 print()
-            else:
-                agent.show_effort_settings()
+                continue
+            if command.startswith("/thinking-budget "):
+                pieces = command.split()
+                if len(pieces) == 2 and pieces[1].isdigit():
+                    agent.set_thinking_budget(int(pieces[1]))
+                else:
+                    print("Usage: /effort budget N (0 to 8192)")
                 print()
-            continue
-        if command.startswith("/effort "):
-            pieces = command.split()
-            if len(pieces) == 2:
-                agent.set_reasoning_effort(pieces[1])
-            elif len(pieces) == 3 and pieces[1] == "budget" and pieces[2].isdigit():
-                agent.set_thinking_budget(int(pieces[2]))
-            else:
-                print("Usage: /effort none|low|medium|high or /effort budget N")
-            print()
-            continue
-        # Keep the former commands as aliases without advertising them in help.
-        if command.startswith("/reasoning "):
-            pieces = command.split()
-            if len(pieces) == 2:
-                agent.set_reasoning_effort(pieces[1])
-            else:
-                print("Usage: /effort none|low|medium|high")
-            print()
-            continue
-        if command.startswith("/thinking-budget "):
-            pieces = command.split()
-            if len(pieces) == 2 and pieces[1].isdigit():
-                agent.set_thinking_budget(int(pieces[1]))
-            else:
-                print("Usage: /effort budget N (0 to 8192)")
-            print()
-            continue
-        if command.startswith("/"):
-            print(f"Unknown command: {user_text}. Type / or /help to see the command list.\n")
-            continue
-        try:
-            agent.handle(user_text)
-            print()
-        except ModelError as exc:
-            if agent.messages and agent.messages[-1].get("role") == "user":
-                agent.messages.pop()
-            print(f"\nModel error: {_terminal_safe(str(exc))}\n")
-        except ToolError as exc:
-            print(f"\nInput error: {_terminal_safe(str(exc))}\n")
-        except KeyboardInterrupt:
-            print("\nTurn interrupted. The local server will stop if you exit.")
+                continue
+            if command.startswith("/"):
+                print(f"Unknown command: {user_text}. Type / or /help to see the command list.\n")
+                continue
+            try:
+                agent.handle(user_text)
+                print()
+            except ModelError as exc:
+                if agent.messages and agent.messages[-1].get("role") == "user":
+                    agent.messages.pop()
+                print(f"\nModel error: {_terminal_safe(str(exc))}\n")
+            except ToolError as exc:
+                print(f"\nInput error: {_terminal_safe(str(exc))}\n")
+            except KeyboardInterrupt:
+                print("\nTurn interrupted. The local server will stop if you exit.")
+    finally:
+        agent.model.close()
 
 
 def launch_agent(
@@ -888,11 +1221,13 @@ def launch_agent(
     reasoning_effort: str = "medium",
     thinking_budget_tokens: int = 512,
     draft_model_file: Path | None = None,
+    thinking_display: str = "show",
 ) -> int:
     terminal_state = enable_terminal_features()
+    model: LocalModelServer | None = None
     try:
         print_welcome(workspace.resolve(), model_file.resolve(), context_length, allow_web)
-        with LocalModelServer(
+        model = LocalModelServer(
             server_exe,
             model_file,
             context_length=context_length,
@@ -904,8 +1239,9 @@ def launch_agent(
             reasoning_effort=reasoning_effort,
             thinking_budget_tokens=thinking_budget_tokens,
             draft_model_file=draft_model_file,
-        ) as model:
-            interactive_cli(model, workspace, allow_web=allow_web)
+        )
+        model.__enter__()
+        interactive_cli(model, workspace, allow_web=allow_web, thinking_display=thinking_display)
     except ModelError as exc:
         print(f"\n{_terminal_safe(str(exc))}", file=sys.stderr)
         return 1
@@ -913,5 +1249,7 @@ def launch_agent(
         print("\nStopping the local model...", file=sys.stderr)
         return 130
     finally:
+        if model is not None:
+            model.close()
         restore_terminal_features(terminal_state)
     return 0
