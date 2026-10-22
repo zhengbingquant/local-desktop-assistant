@@ -21,3 +21,4 @@ dist/
 build/
 /runtime/
 /data/
+.local_assistant/

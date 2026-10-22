@@ -48,6 +48,8 @@ _COMMAND_GROUPS = (
     ("Session & Context", (
         ("/context",            "Show context window usage and details",           "📊"),
         ("/compact",            "Compact conversation history to save tokens",     "🗜️"),
+        ("/save",               "Save the current conversation to disk",           "💾"),
+        ("/resume",             "Resume the last saved conversation",              "↩️"),
         ("/new",                "Start a fresh conversation (/clear)",             "⟳"),
         ("/cls",                "Clear the terminal screen",                       "🧹"),
         ("/help",               "Show available commands",                         "?"),
@@ -71,6 +73,8 @@ _EXTENDED_COMPLETIONS = (
     ("/effort budget ", "Set token budget, e.g. /effort budget 512"),
     ("/web auto", "Enable automatic web lookups"),
     ("/web off", "Disable web — fully offline session"),
+    ("/save", "Save the current conversation to disk for later resume"),
+    ("/resume", "Resume the last saved conversation for this workspace"),
     ("/workspace ", "Switch active workspace folder, e.g. /workspace C:\\project"),
 )
 

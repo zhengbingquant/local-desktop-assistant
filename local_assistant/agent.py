@@ -333,8 +333,47 @@ class LocalAgent:
         self.messages = [system_msg, compact_notice, compact_ack] + recent_msgs
         return len(self.messages)
 
+    def session_file(self) -> Path:
+        return self.workspace / ".local_assistant" / "chat-session.json"
+
+    def save_session(self) -> Path | None:
+        session_path = self.session_file()
+        try:
+            session_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "workspace": str(self.workspace),
+                "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+                "messages": self.messages,
+            }
+            session_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return session_path
+        except OSError:
+            return None
+
+    def load_session(self) -> bool:
+        session_path = self.session_file()
+        if not session_path.exists():
+            return False
+        try:
+            payload = json.loads(session_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return False
+        self.messages = messages
+        if self.messages and self.messages[0].get("role") != "system":
+            self.messages.insert(0, {"role": "system", "content": self.system_prompt})
+        elif self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = self.system_prompt
+        return True
+
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt}]
+        try:
+            self.session_file().unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def handle(self, user_text: str) -> None:
         if len(user_text) > MAX_USER_CHARS:
@@ -414,36 +453,45 @@ class LocalAgent:
             response = _read_legacy_qwen_tool_calls(response, valid_names=allowed_tools, user_prompt=user_text)
             finish_reason = response.pop("_finish_reason", None)
 
-            # Auto-continue if output limit was hit
+            # Auto-continue if output limit was hit.
             continue_rounds = 0
             accumulated_content = response.get("content") or ""
-            while finish_reason == "length" and continue_rounds < 3:
+            while finish_reason == "length" and continue_rounds < 2:
                 continue_rounds += 1
-                color = is_color_enabled()
-                cyan = "\x1b[96m" if color else ""
-                reset = "\x1b[0m" if color else ""
-                print(f"\n{cyan}[Output token limit reached — automatically continuing generation...]{reset}")
 
                 if response.get("tool_calls"):
                     break
 
-                self.messages.append({"role": "assistant", "content": accumulated_content})
+                color = is_color_enabled()
+                cyan = "\x1b[96m" if color else ""
+                reset = "\x1b[0m" if color else ""
+                print(f"\n{cyan}[Output limit reached — auto-continuing ({continue_rounds}/2)...]{reset}")
+
+                tail_content = accumulated_content[-800:] if len(accumulated_content) > 800 else accumulated_content
+                self._auto_compress_context()
+
+                self.messages.append({"role": "assistant", "content": tail_content})
                 self.messages.append({
                     "role": "user",
-                    "content": "You reached the output token limit mid-generation. Continue generating directly from the exact point where you stopped. Do not repeat previous text.",
+                    "content": "Continue from where you stopped. Do not repeat any earlier text.",
                 })
-                self._trim_history()
 
-                cont_printer = _StreamPrinter(allowed_tools=allowed_tools, show_thinking=(self.thinking_display == "show"))
-                cont_response = self.model.stream_chat(
-                    self.messages,
-                    self.tool_schemas(),
-                    cont_printer.feed,
-                    on_thought=thought_cb,
-                )
-                cont_printer.finish()
-                if cont_printer.visible:
-                    print()
+                try:
+                    cont_printer = _StreamPrinter(allowed_tools=allowed_tools, show_thinking=(self.thinking_display == "show"))
+                    cont_response = self.model.stream_chat(
+                        self.messages,
+                        self.tool_schemas(),
+                        cont_printer.feed,
+                        on_thought=thought_cb,
+                    )
+                    cont_printer.finish()
+                    if cont_printer.visible:
+                        print()
+                except ModelError:
+                    self.messages.pop()
+                    self.messages.pop()
+                    self._emergency_compress_context()
+                    break
 
                 self.messages.pop()
                 self.messages.pop()
@@ -453,7 +501,7 @@ class LocalAgent:
                 accumulated_content += cont_text
                 response["content"] = accumulated_content
 
-                cont_parsed = _read_legacy_qwen_tool_calls(response, valid_names=allowed_tools, user_prompt=user_text)
+                cont_parsed = _read_legacy_qwen_tool_calls(cont_response, valid_names=allowed_tools, user_prompt=user_text)
                 if cont_parsed.get("tool_calls"):
                     response["tool_calls"] = cont_parsed["tool_calls"]
                     break
@@ -1110,6 +1158,10 @@ def interactive_cli(
     thinking_display: str = "show",
 ) -> None:
     agent = LocalAgent(model, workspace, allow_web=allow_web, thinking_display=thinking_display)
+    if agent.load_session():
+        print("Resumed the last saved conversation for this workspace.\n")
+    else:
+        print("No saved conversation found for this workspace.\n")
     print("Ready. Type / to browse commands · Ctrl+C interrupts the current turn.\n")
 
     try:
@@ -1123,14 +1175,29 @@ def interactive_cli(
                 continue
             command = user_text.lower()
             if command in {"/exit", "/quit"}:
+                agent.save_session()
                 print("Stopping the assistant...")
                 return
+
             if command in {"/", "/help"}:
                 print_command_menu()
                 continue
             if command in {"/new", "/clear"}:
                 agent.reset()
                 print("Started a fresh conversation.\n")
+                continue
+            if command in {"/save", "/snapshot"}:
+                saved = agent.save_session()
+                if saved:
+                    print(f"Saved conversation to: {saved}\n")
+                else:
+                    print("Could not save the conversation to disk.\n")
+                continue
+            if command in {"/resume", "/restore"}:
+                if agent.load_session():
+                    print("Resumed the last saved conversation.\n")
+                else:
+                    print("No saved conversation was found for this workspace.\n")
                 continue
             if command == "/workspace":
                 print(f"Active workspace: {agent.workspace}")
@@ -1359,6 +1426,7 @@ def interactive_cli(
                 continue
             try:
                 agent.handle(user_text)
+                agent.save_session()
                 print()
             except ModelError as exc:
                 if agent.messages and agent.messages[-1].get("role") == "user":
