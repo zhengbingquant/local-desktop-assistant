@@ -1,6 +1,8 @@
 param(
     [string]$WorkspacePath = (Get-Location).Path,
     [string]$ModelPath,
+    [ValidateSet('auto', '7b', '27b', 'coder', 'qwen27b')]
+    [string]$Model = 'auto',
     [ValidateRange(4096, 32768)]
     [int]$ContextLength = 8192,
     [ValidateRange(0, 24)]
@@ -29,7 +31,15 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $entryPoint = Join-Path $projectRoot 'local_assistant\__main__.py'
 $coderModel = Join-Path $projectRoot 'models\Qwen2.5-Coder-7B\qwen2.5-coder-7b-instruct-q4_k_m.gguf'
 $qwen27bModel = Join-Path $projectRoot 'models\Qwen3.8-27B-HF\Qwen3.8-27B-UD-Q4_K_XL.gguf'
-$defaultModel = if (Test-Path -LiteralPath $coderModel) { $coderModel } else { $qwen27bModel }
+if ($Model -eq '27b' -or $Model -eq 'qwen27b') {
+    $defaultModel = $qwen27bModel
+    if ($KVCacheType -eq 'f16') { $KVCacheType = 'q8_0' }
+    if ($CPUThreads -eq 0) { $CPUThreads = 6 }
+} elseif ($Model -eq '7b' -or $Model -eq 'coder') {
+    $defaultModel = $coderModel
+} else {
+    $defaultModel = if (Test-Path -LiteralPath $coderModel) { $coderModel } else { $qwen27bModel }
+}
 $modelFile = if ($ModelPath) { [IO.Path]::GetFullPath($ModelPath) } else { $defaultModel }
 $draftModel = Join-Path $projectRoot 'models\Qwen3.8-27B-HF\MTP\mtp-Qwen3.8-27B-Q4_0.gguf'
 $workspace = [IO.Path]::GetFullPath($WorkspacePath)
