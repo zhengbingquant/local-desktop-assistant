@@ -377,12 +377,30 @@ class LocalAgent:
                 printer.feed(chunk)
 
             thought_cb = handle_thought if self.thinking_display == "show" else None
-            response = self.model.stream_chat(
-                self.messages,
-                self.tool_schemas(),
-                handle_text,
-                on_thought=thought_cb,
-            )
+            try:
+                response = self.model.stream_chat(
+                    self.messages,
+                    self.tool_schemas(),
+                    handle_text,
+                    on_thought=thought_cb,
+                )
+            except ModelError as exc:
+                err_text = str(exc).lower()
+                if any(k in err_text for k in ("context", "exceed", "token", "400", "parse error", "closing quote")):
+                    color = is_color_enabled()
+                    muted = "\x1b[90m" if color else ""
+                    reset = "\x1b[0m" if color else ""
+                    print(f"\n{muted}[Context overflow: Auto-compressing memory and retrying...]{reset}")
+                    self._emergency_compress_context()
+                    response = self.model.stream_chat(
+                        self.messages,
+                        self.tool_schemas(),
+                        handle_text,
+                        on_thought=thought_cb,
+                    )
+                else:
+                    raise
+
             if thinking_header_printed:
                 color = is_color_enabled()
                 muted = "\x1b[90m" if color else ""
@@ -395,13 +413,57 @@ class LocalAgent:
             _print_performance(response.pop("_metrics", {}))
             response = _read_legacy_qwen_tool_calls(response, valid_names=allowed_tools, user_prompt=user_text)
             finish_reason = response.pop("_finish_reason", None)
+
+            # Auto-continue if output limit was hit
+            continue_rounds = 0
+            accumulated_content = response.get("content") or ""
+            while finish_reason == "length" and continue_rounds < 3:
+                continue_rounds += 1
+                color = is_color_enabled()
+                cyan = "\x1b[96m" if color else ""
+                reset = "\x1b[0m" if color else ""
+                print(f"\n{cyan}[Output token limit reached — automatically continuing generation...]{reset}")
+
+                if response.get("tool_calls"):
+                    break
+
+                self.messages.append({"role": "assistant", "content": accumulated_content})
+                self.messages.append({
+                    "role": "user",
+                    "content": "You reached the output token limit mid-generation. Continue generating directly from the exact point where you stopped. Do not repeat previous text.",
+                })
+                self._trim_history()
+
+                cont_printer = _StreamPrinter(allowed_tools=allowed_tools, show_thinking=(self.thinking_display == "show"))
+                cont_response = self.model.stream_chat(
+                    self.messages,
+                    self.tool_schemas(),
+                    cont_printer.feed,
+                    on_thought=thought_cb,
+                )
+                cont_printer.finish()
+                if cont_printer.visible:
+                    print()
+
+                self.messages.pop()
+                self.messages.pop()
+
+                cont_finish = cont_response.pop("_finish_reason", None)
+                cont_text = cont_response.get("content") or ""
+                accumulated_content += cont_text
+                response["content"] = accumulated_content
+
+                cont_parsed = _read_legacy_qwen_tool_calls(response, valid_names=allowed_tools, user_prompt=user_text)
+                if cont_parsed.get("tool_calls"):
+                    response["tool_calls"] = cont_parsed["tool_calls"]
+                    break
+                finish_reason = cont_finish
+
             calls = response.get("tool_calls") or []
             self.messages.append(response)
             if not calls:
                 if not response.get("content"):
                     print("The model returned an empty response.")
-                elif finish_reason == "length":
-                    print("[The response reached its token limit. Ask me to continue if it was cut off.]")
                 return
 
             for call in calls:
@@ -425,12 +487,25 @@ class LocalAgent:
                 print("\nTool-call limit reached; asking the model for a summary.")
                 printer = _StreamPrinter(allowed_tools=allowed_tools, show_thinking=(self.thinking_display == "show"))
                 thinking_header_printed = False
-                final = self.model.stream_chat(
-                    self.messages,
-                    [],
-                    handle_text,
-                    on_thought=thought_cb,
-                )
+                try:
+                    final = self.model.stream_chat(
+                        self.messages,
+                        [],
+                        handle_text,
+                        on_thought=thought_cb,
+                    )
+                except ModelError as exc:
+                    err_text = str(exc).lower()
+                    if any(k in err_text for k in ("context", "exceed", "token", "400", "parse error", "closing quote")):
+                        self._emergency_compress_context()
+                        final = self.model.stream_chat(
+                            self.messages,
+                            [],
+                            handle_text,
+                            on_thought=thought_cb,
+                        )
+                    else:
+                        raise
                 if thinking_header_printed:
                     color = is_color_enabled()
                     muted = "\x1b[90m" if color else ""
@@ -493,11 +568,101 @@ class LocalAgent:
             compact = compact[:700] + "…"
         print(f"\n[tool: {name}] { _terminal_safe(compact) }")
 
-    def _trim_history(self) -> None:
-        def size() -> int:
-            return sum(len(str(item.get("content", ""))) + len(json.dumps(item, ensure_ascii=False)) // 4 for item in self.messages[1:])
+    def _estimate_tokens(self) -> int:
+        total_chars = 0
+        for m in self.messages:
+            content = m.get("content") or ""
+            total_chars += len(content)
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                total_chars += len(fn.get("name") or "") + len(fn.get("arguments") or "")
+        return (total_chars // 3) + (len(self.messages) * 4)
 
-        while size() > MAX_HISTORY_CHARS:
+    def _auto_compress_context(self) -> None:
+        if len(self.messages) <= 4:
+            return
+
+        system_msg = self.messages[0]
+        older_turns = self.messages[1:-4]
+        if not older_turns:
+            return
+
+        actions: list[str] = []
+        user_goals: list[str] = []
+        for m in older_turns:
+            role = m.get("role")
+            content = str(m.get("content") or "")
+            if role == "user" and not content.startswith("["):
+                first_line = content.strip().splitlines()[0]
+                if len(first_line) > 80:
+                    first_line = first_line[:77] + "..."
+                user_goals.append(first_line)
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                name = fn.get("name")
+                args = fn.get("arguments") or ""
+                if name == "write_file":
+                    try:
+                        parsed = json.loads(args) if isinstance(args, str) else args
+                        path = parsed.get("path") or ""
+                        actions.append(f"Created/edited '{path}'")
+                    except Exception:
+                        pass
+                elif name == "run_command":
+                    try:
+                        parsed = json.loads(args) if isinstance(args, str) else args
+                        cmd = parsed.get("command") or ""
+                        actions.append(f"Ran '{cmd[:40]}'")
+                    except Exception:
+                        pass
+
+        summary_lines = ["[Context: older conversation history auto-compressed to preserve 8K token budget]"]
+        if user_goals:
+            summary_lines.append("Goals tracked: " + " → ".join(user_goals[-3:]))
+        if actions:
+            unique_actions = list(dict.fromkeys(actions))[-6:]
+            summary_lines.append("Actions completed: " + "; ".join(unique_actions))
+        summary_lines.append("Continuing seamlessly with active task.")
+
+        compressed_block = {
+            "role": "system",
+            "content": "\n".join(summary_lines),
+        }
+
+        self.messages = [system_msg, compressed_block] + self.messages[-4:]
+        color = is_color_enabled()
+        muted = "\x1b[90m" if color else ""
+        reset = "\x1b[0m" if color else ""
+        print(f"\n{muted}[Context: Auto-compressed earlier turns to stay within 8K token window]{reset}")
+
+    def _emergency_compress_context(self) -> None:
+        if len(self.messages) <= 2:
+            return
+        system_msg = self.messages[0]
+        latest_turn = self.messages[-2:]
+        for m in latest_turn:
+            content = m.get("content")
+            if isinstance(content, str) and len(content) > 1500:
+                m["content"] = content[:1500] + "\n[truncated for context]"
+        self.messages = [
+            system_msg,
+            {
+                "role": "system",
+                "content": "[Emergency compression applied: older history cleared to fit model context. Proceed with current turn.]",
+            },
+        ] + latest_turn
+
+    def _trim_history(self) -> None:
+        ctx_limit = getattr(self.model, "context_length", 8192)
+        safe_budget = int(ctx_limit * 0.70)
+
+        if self._estimate_tokens() > safe_budget:
+            self._auto_compress_context()
+
+        def size() -> int:
+            return sum(len(str(item.get("content", ""))) for item in self.messages[1:])
+
+        while size() > (safe_budget * 3):
             next_user = next((index for index in range(2, len(self.messages)) if self.messages[index].get("role") == "user"), None)
             if next_user is None:
                 break

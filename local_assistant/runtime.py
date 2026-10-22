@@ -312,7 +312,10 @@ class LocalModelServer:
         on_thought: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         is_reasoning = any(tag in self.model_file.name.lower() for tag in ("qwen3", "deepseek-r1", "reasoning", "thinking"))
-        max_tokens_val = max(2048, min(4096, self.context_length - 1024))
+        # Ensure max_tokens stays safely within the remaining context window room
+        approx_prompt_tokens = sum(len(str(m.get("content") or "")) for m in messages) // 3 + len(messages) * 4
+        remaining_space = max(512, self.context_length - approx_prompt_tokens - 64)
+        max_tokens_val = min(4096, remaining_space)
         body: dict[str, Any] = {
             "model": self.model_file.stem,
             "messages": messages,
