@@ -1,5 +1,7 @@
 param(
     [switch]$Vision,
+    # Separate MTP draft file. Not needed with current llama.cpp builds: the main GGUF
+    # already contains the MTP head, which the assistant uses automatically.
     [switch]$MTP
 )
 
