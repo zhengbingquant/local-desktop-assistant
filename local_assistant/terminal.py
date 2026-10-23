@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .models import ModelInfo, RuntimeTuning, describe_runtime
+
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -59,8 +61,8 @@ _COMMAND_GROUPS = (
 
 # Extended completions for direct typing (e.g. /permission ask, /model 7b)
 _EXTENDED_COMPLETIONS = (
-    ("/model 7b", "Switch to Qwen 2.5 Coder 7B (fast coding, 100% RTX 4050 VRAM)"),
-    ("/model 27b", "Switch to Qwen 3.8 27B (deep reasoning, GPU + AVX-512 CPU)"),
+    ("/model 27b", "Switch to Qwen3.8 27B (default · reasoning · GPU + system RAM)"),
+    ("/model 7b", "Switch to Qwen 2.5 Coder 7B (fast · fits entirely in VRAM)"),
     ("/think show", "Stream thinking and reasoning live in dimmed text"),
     ("/think hide", "Hide thinking process (show 'Thinking...' status only)"),
     ("/permission ask", "Ask before every file change and command"),
@@ -148,25 +150,15 @@ def is_color_enabled() -> bool:
     return sys.stdout.isatty() and (_VT_READY or os.name != "nt")
 
 
-def display_model_name(model_file: Path) -> str:
-    stem = model_file.stem
-    if "-UD-" in stem:
-        return stem.split("-UD-")[0]
-    for tag in ("-q4", "-Q4", "-q8", "-Q8", "-f16", "-F16"):
-        if tag in stem:
-            return stem.split(tag)[0]
-    return stem
-
-
-def print_welcome(workspace: Path, model_file: Path, context_length: int, web_mode: bool) -> None:
+def print_welcome(workspace: Path, model: ModelInfo, tuning: RuntimeTuning, web_mode: bool) -> None:
     color = sys.stdout.isatty() and _VT_READY
     cyan = "\x1b[96m" if color else ""
     white = "\x1b[1;97m" if color else ""
     muted = "\x1b[90m" if color else ""
     reset = "\x1b[0m" if color else ""
 
-    model_name = display_model_name(model_file)
-    context = f"{context_length // 1024}K context"
+    model_name = model.name
+    context = f"{tuning.context_length // 1024}K context" + ("  ·  reasoning" if model.reasoning else "")
     print()
     for line in _LOGO:
         print(f"{cyan}{line}{reset}")
@@ -178,6 +170,7 @@ def print_welcome(workspace: Path, model_file: Path, context_length: int, web_mo
     print()
     print(f"  Workspace   {workspace}")
     print(f"  Model       {model_name}  ·  {context}")
+    print(f"  Runtime     {describe_runtime(model, tuning)}")
     if web_mode:
         print(f"  Web         Auto lookups  ·  shown before each search")
     else:
@@ -314,7 +307,7 @@ def read_prompt_line(prompt: str = "You › ") -> str:
     width = max(20, shutil.get_terminal_size((100, 30)).columns)
 
     def matches() -> list[tuple[str, str, str, str]]:
-        if dismissed or not buffer.startswith("/"):
+        if dismissed or not buffer.startswith("/") or "\n" in buffer:
             return []
         prefix = buffer.casefold()
         if " " not in buffer:
@@ -327,7 +320,7 @@ def read_prompt_line(prompt: str = "You › ") -> str:
 
     def redraw() -> None:
         nonlocal previous_cursor_row
-        line = prompt + buffer
+        line = prompt + buffer.replace("\n", "↵")
         cursor_position = len(prompt) + cursor
         if previous_cursor_row:
             sys.stdout.write("\r\x1b[" + str(previous_cursor_row) + "A")
@@ -383,6 +376,15 @@ def read_prompt_line(prompt: str = "You › ") -> str:
     redraw()
     while True:
         key = msvcrt.getwch()
+        # While pasted text is still queued, skip redraws so long pastes stay fast.
+        if key == "\n" or (key == "\r" and msvcrt.kbhit()):
+            # Ctrl+Enter, or a line break inside pasted text: keep composing one message.
+            buffer = buffer[:cursor] + "\n" + buffer[cursor:]
+            cursor += 1
+            dismissed = True
+            if not msvcrt.kbhit():
+                redraw()
+            continue
         if key == "\r":
             options = matches()
             if options and buffer != options[selected % len(options)][0]:
@@ -420,6 +422,11 @@ def read_prompt_line(prompt: str = "You › ") -> str:
                 buffer = buffer[:cursor] + buffer[cursor + 1:]
             redraw()
             continue
+        if key == "\t" and msvcrt.kbhit():
+            # Indentation inside pasted text, not a completion request.
+            buffer = buffer[:cursor] + "    " + buffer[cursor:]
+            cursor += 4
+            continue
         if key == "\t":
             options = matches()
             if options:
@@ -441,4 +448,5 @@ def read_prompt_line(prompt: str = "You › ") -> str:
             cursor += len(key)
             selected = 0
             dismissed = False
-            redraw()
+            if not msvcrt.kbhit():
+                redraw()

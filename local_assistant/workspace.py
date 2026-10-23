@@ -165,12 +165,17 @@ class WorkspaceTools:
         permission_mode: str = "ask",
         process_attacher: Callable[[subprocess.Popen[Any]], None] | None = None,
     ) -> None:
-        self.root = workspace.expanduser().resolve(strict=True)
-        if not self.root.is_dir():
-            raise ToolError(f"Workspace is not a directory: {self.root}")
         self.permission_mode = "ask"
         self.set_permission_mode(permission_mode)
         self.process_attacher = process_attacher
+        self.set_root(workspace)
+
+    def set_root(self, workspace: Path) -> None:
+        """Point the tools at a workspace folder and load that folder's .gitignore."""
+        root = workspace.expanduser().resolve(strict=True)
+        if not root.is_dir():
+            raise ToolError(f"Workspace is not a directory: {root}")
+        self.root = root
         self.gitignore = self._read_gitignore()
 
     def set_permission_mode(self, mode: str) -> None:
@@ -244,11 +249,15 @@ class WorkspaceTools:
         try:
             if file.stat().st_size > 100_000:
                 return []
-            return [
-                line.strip()
-                for line in file.read_text(encoding="utf-8-sig").splitlines()
-                if line.strip() and not line.lstrip().startswith("#") and not line.startswith("!")
-            ]
+            patterns = []
+            for line in file.read_text(encoding="utf-8-sig").splitlines():
+                line = line.strip()
+                if not line or line.startswith(("#", "!")):
+                    continue
+                normalized = line.replace("\\", "/").rstrip("/")
+                if normalized:
+                    patterns.append(normalized)
+            return patterns
         except (OSError, UnicodeError):
             return []
 
@@ -265,13 +274,10 @@ class WorkspaceTools:
         if path.suffix.lower() in IGNORED_SUFFIXES:
             return True
         for pattern in self.gitignore:
-            normalized = pattern.replace("\\", "/").rstrip("/")
-            if not normalized:
-                continue
-            if "/" in normalized:
-                if fnmatch.fnmatchcase(relative, normalized) or relative.startswith(normalized + "/"):
+            if "/" in pattern:
+                if fnmatch.fnmatchcase(relative, pattern) or relative.startswith(pattern + "/"):
                     return True
-            elif any(fnmatch.fnmatchcase(part, normalized) for part in parts):
+            elif any(fnmatch.fnmatchcase(part, pattern) for part in parts):
                 return True
         return False
 
@@ -372,9 +378,11 @@ class WorkspaceTools:
 
         matches: list[str] = []
         files_scanned = 0
+        needle = query.casefold()
+        # The walker already applies the ignore policy; a directly named file was checked above.
         iterable = [base] if base.is_file() else self._walk_files(base, max_depth=10)
         for file in iterable:
-            if not file.is_file() or self._ignored(file) or not fnmatch.fnmatch(file.name, file_glob):
+            if not fnmatch.fnmatch(file.name, file_glob):
                 continue
             files_scanned += 1
             if files_scanned > 4000:
@@ -388,9 +396,11 @@ class WorkspaceTools:
                 content = data.decode("utf-8-sig")
             except (OSError, UnicodeError):
                 continue
+            if needle not in content.casefold():
+                continue
+            relative = file.relative_to(self.root).as_posix()
             for line_number, line in enumerate(content.splitlines(), 1):
-                if query.casefold() in line.casefold():
-                    relative = file.relative_to(self.root).as_posix()
+                if needle in line.casefold():
                     matches.append(f"{relative}:{line_number}: {line.strip()[:300]}")
                     if len(matches) >= max_results:
                         return "\n".join(matches) + "\n[results capped]"
@@ -591,6 +601,13 @@ class WorkspaceTools:
             else:
                 output = ""
             return f"Command timed out after {timeout_seconds} seconds. The PowerShell process was stopped.\n{_terminal_safe((output or '')[-8_000:])}"
+        except KeyboardInterrupt:
+            if process is not None and process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            raise
         except OSError as exc:
             raise ToolError(f"Could not start the approved command: {exc}") from exc
 

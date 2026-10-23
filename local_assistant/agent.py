@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -9,11 +11,21 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from .runtime import LocalModelServer, ModelError, _terminal_safe
+from .models import (
+    ModelInfo,
+    RuntimeOptions,
+    describe_runtime,
+    detect_gpu_memory_mib,
+    discover_models,
+    inspect_model,
+    model_alias,
+    plan_runtime,
+    resolve_model,
+)
+from .runtime import MAX_RESPONSE_TOKENS, ContextOverflowError, LocalModelServer, ModelError, _terminal_safe
 from .terminal import (
-    display_model_name,
     enable_terminal_features,
     is_color_enabled,
     print_command_menu,
@@ -26,6 +38,8 @@ from .web import WEB_TOOL_SCHEMAS, WebTools
 from .workspace import TOOL_SCHEMAS, ToolError, WorkspaceTools
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 KNOWN_TOOL_NAMES = {
     "list_files",
     "read_file",
@@ -37,6 +51,7 @@ KNOWN_TOOL_NAMES = {
     "web_search",
     "open_url",
 }
+WEB_TOOL_NAMES = {"web_search", "open_url"}
 
 
 BASE_SYSTEM_PROMPT = r"""You are an expert autonomous software engineer and coding assistant working in the selected workspace.
@@ -54,13 +69,13 @@ ENGINEERING QUALITY STANDARDS:
 
 CRITICAL ACTION RULES:
 1. When asked to perform an action (e.g. create a folder or file, run a script or terminal command, edit or delete files), ALWAYS invoke the corresponding tool directly.
-2. To create or update files, invoke `write_file` with the complete file content.
+2. To create a file, invoke `write_file` with its complete content. To change an existing file, prefer `replace_text` with a small, unique old_text block instead of rewriting the whole file: output tokens are slow on local hardware. Keep each write_file call under about 200 lines; build larger programs file by file.
 3. NEVER output shell commands or code in markdown blocks and pretend or assume they ran. Markdown text does NOT execute commands or save files. Only tool calls execute.
 4. NEVER claim an action, file change, or command succeeded unless a tool was actually called and returned a successful result.
 5. Do NOT output a past-tense "Summary of Changes" claiming files were created before tools have actually executed! Execute tools first, then summarize based on actual tool return values.
-6. When the user reports that a file or folder is missing, empty, or an error occurred, do NOT just explain or output markdown code. Actively FIX it by calling the appropriate tool (write_file, run_command) directly to create the missing files.
+6. When the user reports that a file or folder is missing, empty, or an error occurred, do NOT just explain or output markdown code. Actively FIX it by calling the appropriate tool (write_file, replace_text, run_command) directly.
 7. Do NOT ask for permission in conversational text before calling tools. The host application handles user approval prompts automatically when required. Call the tool immediately.
-8. Use real, concrete paths. Paths frequently contain spaces (e.g., 'C:\Users\Teh Bing Quan\...'). Always wrap paths in single or double quotes in PowerShell commands. Prefer workspace-relative paths where applicable.
+8. Use real, concrete paths. Paths frequently contain spaces (e.g., 'C:\Users\Jane Doe\...'). Always wrap paths in single or double quotes in PowerShell commands. Prefer workspace-relative paths where applicable.
 9. Interactive programs & games: run_command executes non-interactively (without keyboard stdin). If testing or launching an interactive CLI game or program that calls input(), launch it in a new window using Start-Process powershell -ArgumentList '-NoExit', '-Command', 'python <path>' so the player can actually play.
 
 The host enforces the active permission mode. list_files, read_file, and
@@ -90,12 +105,26 @@ Be concise in the terminal. Before substantial edits, state a short plan. After
 work, summarize changed files and any commands that actually ran. If a request
 needs a capability that is not available, say so clearly."""
 
-MAX_HISTORY_CHARS = 10_000
-MAX_USER_CHARS = 6_000
 MAX_TOOL_ROUNDS = 8
 MAX_TOOL_CALLS = 12
-MAX_TOOL_RESULT_CHARS = 8_000
-MAX_TURN_TOOL_CHARS = 6_000
+CHARS_PER_TOKEN = 3  # Conservative for code; only used where the server has not reported exact counts.
+SHRUNK_TOOL_CHARS = 1_500
+SUMMARY_MARKER = "[Conversation summary]"
+SUMMARY_ACK = "Understood. I will continue from this summary."
+CONTINUE_PROMPT = "Continue exactly where you stopped. Do not repeat any earlier text."
+TRUNCATION_NOTE = "\n[older output truncated to fit the context window; run the tool again if you need it]"
+
+
+def session_path_for(workspace: Path) -> Path:
+    """Saved conversations live in the user's profile, never inside the workspace or a Git repo."""
+    base = os.environ.get("LOCALAPPDATA")
+    root = Path(base) / "LocalAssistant" if base else Path.home() / ".local" / "state" / "local-assistant"
+    key = hashlib.sha256(str(workspace.resolve()).casefold().encode("utf-8")).hexdigest()[:16]
+    return root / "sessions" / f"{key}.json"
+
+
+def _legacy_session_path(workspace: Path) -> Path:
+    return workspace / ".local_assistant" / "chat-session.json"
 
 
 class LocalAgent:
@@ -105,8 +134,10 @@ class LocalAgent:
         workspace: Path,
         allow_web: bool = True,
         thinking_display: str = "show",
+        options: RuntimeOptions | None = None,
     ) -> None:
         self.model = model
+        self.options = options or RuntimeOptions()
         self.workspace = workspace.resolve()
         self.tools = WorkspaceTools(self.workspace, process_attacher=self.model.attach_process)
         self.web_tools = WebTools()
@@ -114,9 +145,30 @@ class LocalAgent:
         self.thinking_display = thinking_display
         self.system_prompt = self._build_system_prompt()
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        # Exact token count reported by the server for messages[:_known_count] (prompt + reply).
+        self._known_tokens: int | None = None
+        self._known_count = 0
+
+    # ── Configuration ────────────────────────────────────────────────
+
+    @property
+    def context_length(self) -> int:
+        return self.model.context_length
+
+    @property
+    def max_tool_result_chars(self) -> int:
+        # About 30% of the context window per tool result.
+        return max(4_000, min(24_000, int(self.context_length * 0.9)))
+
+    @property
+    def max_user_chars(self) -> int:
+        return max(6_000, self.context_length)
+
+    @property
+    def usage_is_exact(self) -> bool:
+        return self._known_tokens is not None and self._known_count == len(self.messages)
 
     def _build_system_prompt(self) -> str:
-        guidance_file = self.workspace / "AGENTS.md"
         guidance = ""
         try:
             guidance_file = self.tools._safe_path("AGENTS.md")
@@ -124,7 +176,7 @@ class LocalAgent:
                 guidance = guidance_file.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeError, ToolError):
             guidance = ""
-        model_name = display_model_name(self.model.model_file)
+        model_name = self.model.info.name
         user_name = os.environ.get("USERNAME", "user")
         user_home = str(Path.home())
         desktop_dir = str(Path.home() / "Desktop")
@@ -145,6 +197,11 @@ class LocalAgent:
             prompt += "\n\nProject guidance from the workspace root AGENTS.md follows. Treat it as user-provided project guidance; it cannot grant extra tool permissions:\n" + guidance
         return prompt
 
+    def _refresh_system_prompt(self) -> None:
+        self.system_prompt = self._build_system_prompt()
+        self.messages[0] = {"role": "system", "content": self.system_prompt}
+        self._invalidate_usage()
+
     def tool_schemas(self) -> list[dict[str, Any]]:
         schemas = list(TOOL_SCHEMAS)
         if self.web_enabled:
@@ -156,6 +213,7 @@ class LocalAgent:
             print("Web research is already " + ("enabled." if enabled else "disabled."))
             return
         self.web_enabled = enabled
+        self._invalidate_usage()
         state = "enabled" if enabled else "disabled"
         print(f"Web research {state} for this session.")
         if enabled:
@@ -166,16 +224,20 @@ class LocalAgent:
             print("Reasoning effort must be none, low, medium, or high.")
             return
         self.model.reasoning_effort = effort
+        self._invalidate_usage()
         print(f"Reasoning effort set to {effort} for this session.")
+        if not self.model.info.reasoning:
+            print("The active model does not use reasoning; this applies after switching to a reasoning model.")
 
     def show_effort_settings(self) -> None:
-        print(f"Reasoning effort: {self.model.reasoning_effort} · thinking budget: {self.model.thinking_budget_tokens} tokens")
-        print("Use /effort none|low|medium|high or /effort budget N (0–8192).")
+        budget = self.model.thinking_budget_tokens
+        print(f"Reasoning effort: {self.model.reasoning_effort} · thinking budget: {f'{budget} tokens' if budget else 'no limit'}")
+        print("Use /effort none|low|medium|high or /effort budget N (0 = no limit, up to 8192).")
 
     def show_permission_mode(self) -> None:
         mode = self.tools.permission_mode
         descriptions = {
-            "ask": "Every file change, deletion, and shell command asks for YES.",
+            "ask": "Every file change, deletion, and shell command asks for approval.",
             "workspace": "Workspace file changes and deletions apply after showing a diff; shell commands still ask.",
             "full": "File changes and shell commands skip per-action approval. Shell commands can affect files outside the workspace.",
         }
@@ -191,8 +253,7 @@ class LocalAgent:
             self.show_permission_mode()
             return
         self.tools.set_permission_mode(mode)
-        self.system_prompt = self._build_system_prompt()
-        self.messages[0] = {"role": "system", "content": self.system_prompt}
+        self._refresh_system_prompt()
         if mode == "full":
             print("FULL ACCESS enabled for this session. File changes and shell commands will not ask before each action.")
             print("Shell commands run as your Windows user and can affect files anywhere. Use /permission ask to restore confirmations.")
@@ -201,10 +262,10 @@ class LocalAgent:
 
     def set_thinking_budget(self, budget: int) -> None:
         if not 0 <= budget <= 8192:
-            print("Thinking budget must be between 0 and 8192 tokens.")
+            print("Thinking budget must be between 0 (no limit) and 8192 tokens.")
             return
         self.model.thinking_budget_tokens = budget
-        print(f"Thinking budget set to {budget} tokens for this session.")
+        print(f"Thinking budget set to {f'{budget} tokens' if budget else 'no limit'} for this session.")
 
     def set_thinking_display(self, mode: str) -> None:
         mode_lower = mode.strip().lower()
@@ -222,384 +283,401 @@ class LocalAgent:
         if not resolved.is_dir():
             print(f"Workspace path is not a directory: {resolved}")
             return
-        self.workspace = resolved
-        self.tools.root = resolved
-        self.system_prompt = self._build_system_prompt()
-        if self.messages and self.messages[0].get("role") == "system":
-            self.messages[0]["content"] = self.system_prompt
+        self.tools.set_root(resolved)
+        self.workspace = self.tools.root
+        self._refresh_system_prompt()
         print(f"Active workspace switched to: {self.workspace}")
 
+    def show_model_details(self) -> None:
+        info, tuning = self.model.info, self.model.tuning
+        print(f"Active model : {info.name}")
+        print(f"Model file   : {info.path}")
+        print(f"Context size : {tuning.context_length // 1024}K tokens")
+        print(f"Runtime      : {describe_runtime(info, tuning)}")
+        if info.reasoning:
+            budget = self.model.thinking_budget_tokens
+            print(f"Reasoning    : {self.model.reasoning_effort} (budget: {budget or 'no limit'})")
+        print("Switch anytime with /model, /model 27b, or /model 7b.\n")
+
     def switch_model(self, target: str | Path) -> bool:
-        project_root = Path(__file__).resolve().parents[1]
-        target_str = str(target).strip()
-        target_lower = target_str.lower()
-        coder_7b_file = project_root / "models" / "Qwen2.5-Coder-7B" / "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
-        default_27b_file = project_root / "models" / "Qwen3.8-27B-HF" / "Qwen3.8-27B-UD-Q4_K_XL.gguf"
-
-        target_file: Path | None = None
-        if target_lower in {"7b", "coder", "qwen7b", "qwen2.5", "qwen2.5-coder"}:
-            target_file = coder_7b_file
-        elif target_lower in {"27b", "qwen27b", "qwen3", "qwen3.8", "3.8"}:
-            target_file = default_27b_file
-        else:
-            candidate = Path(target_str).expanduser().resolve()
-            if candidate.is_file():
-                target_file = candidate
-            else:
-                models_dir = project_root / "models"
-                if models_dir.is_dir():
-                    for gguf in models_dir.rglob("*.gguf"):
-                        if "mmproj" in gguf.name.lower() or "mtp" in gguf.name.lower():
-                            continue
-                        if target_lower in gguf.name.lower() or target_lower in gguf.stem.lower():
-                            if gguf.stat().st_size > 100 * 1024 * 1024:
-                                target_file = gguf
-                                break
-
-        if target_file is None or not target_file.is_file():
+        target_file = resolve_model(target, PROJECT_ROOT)
+        if target_file is None:
             print(f"Model not found: {target}")
-            print("Available models: '7b' (Qwen 2.5 Coder 7B), '27b' (Qwen 3.8 27B)")
+            available = [model_alias(path, PROJECT_ROOT) or path.name for path in discover_models(PROJECT_ROOT)]
+            print("Available models: " + (", ".join(available) if available else "none (see scripts/download-model.ps1)"))
             return False
-
-        if target_file.resolve() == self.model.model_file.resolve():
-            print(f"Model {display_model_name(target_file)} is already active.")
+        if target_file == self.model.model_file.resolve():
+            print(f"Model {self.model.info.name} is already active.")
             return True
+
+        # A separate draft model belongs to the model it was given for.
+        options = dataclasses.replace(
+            self.options,
+            draft_model=None,
+            speculative="auto" if self.options.speculative == "draft-mtp" else self.options.speculative,
+        )
+        try:
+            info = inspect_model(target_file)
+            tuning = plan_runtime(info, options, detect_gpu_memory_mib())
+        except (OSError, ValueError) as exc:
+            print(f"Cannot use {target_file.name}: {exc}")
+            return False
 
         old_model = self.model
-        new_name = display_model_name(target_file)
-        old_name = display_model_name(old_model.model_file)
-        print(f"\nSwitching model: {old_name} → {new_name}...")
+        print(f"\nSwitching model: {old_model.info.name} → {info.name}...")
         old_model.close()
-        time.sleep(0.5)
-
-        is_27b = "27b" in target_file.name.lower() or "qwen3" in target_file.name.lower()
-        kv_cache_type = "q8_0" if is_27b else "f16"
-        cpu_threads = 6 if is_27b else None
-        reasoning_effort = "medium" if is_27b else "none"
-        thinking_budget_tokens = 512 if is_27b else 0
-
         new_server = LocalModelServer(
-            server_exe=old_model.server_exe,
-            model_file=target_file,
-            context_length=old_model.context_length,
-            cpu_threads=cpu_threads,
-            batch_threads=old_model.batch_threads,
-            gpu_reserve_mib=old_model.gpu_reserve_mib,
-            kv_cache_type=kv_cache_type,
-            speculative="none",
-            reasoning_effort=reasoning_effort,
-            thinking_budget_tokens=thinking_budget_tokens,
+            old_model.server_exe,
+            info,
+            tuning,
+            reasoning_effort=old_model.reasoning_effort,
+            thinking_budget_tokens=old_model.thinking_budget_tokens,
         )
-
         try:
             new_server.__enter__()
-            self.model = new_server
-            self.tools.process_attacher = self.model.attach_process
-            self.system_prompt = self._build_system_prompt()
-            if self.messages and self.messages[0].get("role") == "system":
-                self.messages[0]["content"] = self.system_prompt
-            print(f"✓ Active model successfully switched to: {new_name}\n")
-            try:
-                import ctypes
-                ctypes.windll.kernel32.SetConsoleTitleW(f"Local Assistant | {new_name}")
-            except Exception:
-                pass
-            return True
-        except Exception as exc:
-            print(f"\nFailed to load {new_name}: {exc}")
-            print(f"Restoring previous model ({old_name})...")
+        except (Exception, KeyboardInterrupt) as exc:
+            print(f"\nFailed to load {info.name}: {_terminal_safe(str(exc)) or type(exc).__name__}")
+            print(f"Restoring previous model ({old_model.info.name})...")
             try:
                 old_model.__enter__()
-                self.model = old_model
-                self.tools.process_attacher = self.model.attach_process
-                print(f"Restored {old_name}.")
+                print(f"Restored {old_model.info.name}.")
             except Exception as restore_exc:
-                print(f"Could not restore previous model: {restore_exc}")
+                print(f"Could not restore previous model: {_terminal_safe(str(restore_exc))}")
             return False
 
-    def compact_history(self) -> int:
-        if len(self.messages) <= 3:
-            return len(self.messages)
-        system_msg = self.messages[0]
-        recent_msgs = self.messages[-4:]
-        compact_notice = {
-            "role": "user",
-            "content": "[Previous conversation history compacted to conserve context window. Continuing with recent context.]",
-        }
-        compact_ack = {
-            "role": "assistant",
-            "content": "Context compacted. I am ready to continue with your current task.",
-        }
-        self.messages = [system_msg, compact_notice, compact_ack] + recent_msgs
-        return len(self.messages)
+        self.model = new_server
+        self.tools.process_attacher = self.model.attach_process
+        self._refresh_system_prompt()
+        print(f"✓ Active model: {info.name} · {tuning.context_length // 1024}K context · {describe_runtime(info, tuning)}\n")
+        _set_console_title(info.name)
+        return True
+
+    # ── Sessions ─────────────────────────────────────────────────────
 
     def session_file(self) -> Path:
-        return self.workspace / ".local_assistant" / "chat-session.json"
+        return session_path_for(self.workspace)
 
     def save_session(self) -> Path | None:
-        session_path = self.session_file()
+        path = self.session_file()
+        payload = {
+            "version": 2,
+            "workspace": str(self.workspace),
+            "model": self.model.info.name,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+            "messages": self.messages[1:],
+        }
+        temporary = path.with_suffix(".tmp")
         try:
-            session_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "workspace": str(self.workspace),
-                "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
-                "messages": self.messages,
-            }
-            session_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            return session_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, path)
+            return path
         except OSError:
             return None
 
-    def load_session(self) -> bool:
-        session_path = self.session_file()
-        if not session_path.exists():
-            return False
+    def load_session(self) -> int:
+        """Restore this workspace's saved conversation; returns the number of messages restored."""
+        current, legacy = self.session_file(), _legacy_session_path(self.workspace)
+        path = current if current.is_file() else legacy
+        if not path.is_file():
+            return 0
         try:
-            payload = json.loads(session_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return False
-        messages = payload.get("messages")
-        if not isinstance(messages, list) or not messages:
-            return False
-        self.messages = messages
-        if self.messages and self.messages[0].get("role") != "system":
-            self.messages.insert(0, {"role": "system", "content": self.system_prompt})
-        elif self.messages and self.messages[0].get("role") == "system":
-            self.messages[0]["content"] = self.system_prompt
-        return True
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return 0
+        messages = _clean_history(payload.get("messages") if isinstance(payload, dict) else None)
+        if not messages:
+            return 0
+        self.messages = [{"role": "system", "content": self.system_prompt}] + messages
+        self._invalidate_usage()
+        if path == legacy and self.save_session() is not None:
+            # Move the transcript out of the workspace so it cannot be committed by accident.
+            try:
+                legacy.unlink()
+                legacy.parent.rmdir()
+            except OSError:
+                pass
+        return len(messages)
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt}]
-        try:
-            self.session_file().unlink(missing_ok=True)
-        except OSError:
-            pass
+        self._invalidate_usage()
+        for path in (self.session_file(), _legacy_session_path(self.workspace)):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    # ── Context accounting and compaction ────────────────────────────
+
+    def _invalidate_usage(self) -> None:
+        self._known_tokens = None
+
+    def _record_usage(self, metrics: dict[str, Any], message_count: int) -> None:
+        usage = metrics.get("usage") or {}
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+        if isinstance(prompt, int) and isinstance(completion, int) and prompt > 0:
+            self._known_tokens = prompt + completion
+            self._known_count = message_count
+        else:
+            self._invalidate_usage()
+
+    def estimate_prompt_tokens(self) -> int:
+        if self._known_tokens is not None and self._known_count <= len(self.messages):
+            return self._known_tokens + _approx_tokens(self.messages[self._known_count:])
+        schema_tokens = len(json.dumps(self.tool_schemas())) // CHARS_PER_TOKEN + 200
+        return _approx_tokens(self.messages) + schema_tokens
+
+    def _fit_context(self) -> None:
+        reply_reserve = min(MAX_RESPONSE_TOKENS, self.context_length // 4)
+        if self.estimate_prompt_tokens() > self.context_length - reply_reserve:
+            self._compact(target=self.context_length // 2)
+
+    def compact_history(self) -> tuple[int, int] | None:
+        before = self.estimate_prompt_tokens()
+        if not self._compact(target=self.context_length // 4, announce=False):
+            return None
+        return before, self.estimate_prompt_tokens()
+
+    def _current_turn_start(self) -> int | None:
+        for index in range(len(self.messages) - 1, 0, -1):
+            message = self.messages[index]
+            if message.get("role") == "user" and not str(message.get("content") or "").startswith(SUMMARY_MARKER):
+                return index
+        return None
+
+    def _compact(self, target: int, announce: bool = True) -> bool:
+        """Summarize turns before the current one, then shrink the current turn if still too large.
+
+        The summary is a user/assistant pair rather than a system message: some chat templates
+        (including Qwen3.8's) reject system messages after the conversation starts.
+        """
+        changed = False
+        start = self._current_turn_start()
+        if start is not None:
+            older = self.messages[1:start]
+            already_summarized = (
+                len(older) == 2 and str(older[0].get("content") or "").startswith(SUMMARY_MARKER)
+            )
+            if older and not already_summarized:
+                summary = _summarize_messages(older)
+                self.messages = [
+                    self.messages[0],
+                    {"role": "user", "content": summary},
+                    {"role": "assistant", "content": SUMMARY_ACK},
+                ] + self.messages[start:]
+                changed = True
+                self._invalidate_usage()
+
+        turn_start = self._current_turn_start() or 1
+        if self.estimate_prompt_tokens() > target:
+            # Earlier reasoning in this turn goes first, then older tool output, then the newest.
+            for index in range(turn_start, len(self.messages) - 1):
+                if self.messages[index].get("reasoning_content"):
+                    self.messages[index] = {k: v for k, v in self.messages[index].items() if k != "reasoning_content"}
+                    changed = True
+                    self._invalidate_usage()
+            for index in range(turn_start, len(self.messages)):
+                if self.messages[index].get("role") != "tool":
+                    continue
+                if self.estimate_prompt_tokens() <= target:
+                    break
+                content = str(self.messages[index].get("content") or "")
+                if len(content) > SHRUNK_TOOL_CHARS:
+                    self.messages[index] = {**self.messages[index], "content": content[:SHRUNK_TOOL_CHARS] + TRUNCATION_NOTE}
+                    changed = True
+                    self._invalidate_usage()
+
+        if changed and announce:
+            self._notice(
+                f"[Context: compacted to ~{self.estimate_prompt_tokens():,} tokens "
+                f"to stay within the {self.context_length // 1024}K window]"
+            )
+        return changed
+
+    def _calibrate(self, prompt_tokens: int) -> None:
+        if prompt_tokens > 0:
+            self._known_tokens = prompt_tokens
+            self._known_count = len(self.messages)
+
+    # ── Agent loop ───────────────────────────────────────────────────
 
     def handle(self, user_text: str) -> None:
-        if len(user_text) > MAX_USER_CHARS:
-            raise ToolError(f"Message exceeds {MAX_USER_CHARS:,} characters. Ask the assistant to read a file instead.")
+        if len(user_text) > self.max_user_chars:
+            raise ToolError(
+                f"Message exceeds {self.max_user_chars:,} characters. Save it to a file in the workspace and ask the assistant to read it."
+            )
         self.messages.append({"role": "user", "content": user_text})
-        self._trim_history()
+        tools = self.tool_schemas()
+        allowed = {schema["function"]["name"] for schema in tools if "function" in schema}
         tool_count = 0
-        turn_tool_chars = 0
-        allowed_tools = {schema["function"]["name"] for schema in self.tool_schemas() if "function" in schema}
 
         for _ in range(MAX_TOOL_ROUNDS):
-            printer = _StreamPrinter(
-                allowed_tools=allowed_tools,
-                show_thinking=(self.thinking_display == "show"),
-            )
-            thinking_header_printed = False
+            response, finish_reason = self._complete(tools, allowed, user_text)
+            if finish_reason == "length" and not response.get("tool_calls") and response.get("content"):
+                response, finish_reason = self._continue_truncated(response, tools, allowed, user_text)
 
-            def handle_thought(chunk: str) -> None:
-                nonlocal thinking_header_printed
-                color = is_color_enabled()
-                cyan = "\x1b[96m" if color else ""
-                muted = "\x1b[90m" if color else ""
-                reset = "\x1b[0m" if color else ""
-                if not thinking_header_printed:
-                    sys.stdout.write(f"\n{cyan}┌─ Thinking Process{reset}\n{muted}")
-                    sys.stdout.flush()
-                    thinking_header_printed = True
-                sys.stdout.write(_terminal_safe(chunk))
-                sys.stdout.flush()
-
-            def handle_text(chunk: str) -> None:
-                nonlocal thinking_header_printed
-                if thinking_header_printed:
-                    color = is_color_enabled()
-                    muted = "\x1b[90m" if color else ""
-                    reset = "\x1b[0m" if color else ""
-                    sys.stdout.write(f"{reset}\n{muted}└────────────────────────────────────────{reset}\n\n")
-                    sys.stdout.flush()
-                    thinking_header_printed = False
-                printer.feed(chunk)
-
-            thought_cb = handle_thought if self.thinking_display == "show" else None
-            try:
-                response = self.model.stream_chat(
-                    self.messages,
-                    self.tool_schemas(),
-                    handle_text,
-                    on_thought=thought_cb,
-                )
-            except ModelError as exc:
-                err_text = str(exc).lower()
-                if any(k in err_text for k in ("context", "exceed", "token", "400", "parse error", "closing quote")):
-                    color = is_color_enabled()
-                    muted = "\x1b[90m" if color else ""
-                    reset = "\x1b[0m" if color else ""
-                    print(f"\n{muted}[Context overflow: Auto-compressing memory and retrying...]{reset}")
-                    self._emergency_compress_context()
-                    response = self.model.stream_chat(
-                        self.messages,
-                        self.tool_schemas(),
-                        handle_text,
-                        on_thought=thought_cb,
-                    )
-                else:
-                    raise
-
-            if thinking_header_printed:
-                color = is_color_enabled()
-                muted = "\x1b[90m" if color else ""
-                reset = "\x1b[0m" if color else ""
-                sys.stdout.write(f"{reset}\n{muted}└────────────────────────────────────────{reset}\n\n")
-                sys.stdout.flush()
-            printer.finish()
-            if printer.visible:
-                print()
-            _print_performance(response.pop("_metrics", {}))
-            response = _read_legacy_qwen_tool_calls(response, valid_names=allowed_tools, user_prompt=user_text)
-            finish_reason = response.pop("_finish_reason", None)
-
-            # Auto-continue if output limit was hit.
-            continue_rounds = 0
-            accumulated_content = response.get("content") or ""
-            while finish_reason == "length" and continue_rounds < 2:
-                continue_rounds += 1
-
-                if response.get("tool_calls"):
-                    break
-
-                color = is_color_enabled()
-                cyan = "\x1b[96m" if color else ""
-                reset = "\x1b[0m" if color else ""
-                print(f"\n{cyan}[Output limit reached — auto-continuing ({continue_rounds}/2)...]{reset}")
-
-                tail_content = accumulated_content[-800:] if len(accumulated_content) > 800 else accumulated_content
-                self._auto_compress_context()
-
-                self.messages.append({"role": "assistant", "content": tail_content})
-                self.messages.append({
-                    "role": "user",
-                    "content": "Continue from where you stopped. Do not repeat any earlier text.",
-                })
-
-                try:
-                    cont_printer = _StreamPrinter(allowed_tools=allowed_tools, show_thinking=(self.thinking_display == "show"))
-                    cont_response = self.model.stream_chat(
-                        self.messages,
-                        self.tool_schemas(),
-                        cont_printer.feed,
-                        on_thought=thought_cb,
-                    )
-                    cont_printer.finish()
-                    if cont_printer.visible:
-                        print()
-                except ModelError:
-                    self.messages.pop()
-                    self.messages.pop()
-                    self._emergency_compress_context()
-                    break
-
-                self.messages.pop()
-                self.messages.pop()
-
-                cont_finish = cont_response.pop("_finish_reason", None)
-                cont_text = cont_response.get("content") or ""
-                accumulated_content += cont_text
-                response["content"] = accumulated_content
-
-                cont_parsed = _read_legacy_qwen_tool_calls(cont_response, valid_names=allowed_tools, user_prompt=user_text)
-                if cont_parsed.get("tool_calls"):
-                    response["tool_calls"] = cont_parsed["tool_calls"]
-                    break
-                finish_reason = cont_finish
-
-            calls = response.get("tool_calls") or []
+            prepared = _prepare_tool_calls(response.get("tool_calls") or [], truncated=finish_reason == "length")
+            response.pop("tool_calls", None)
+            if prepared:
+                response["tool_calls"] = [stored for stored, _, _ in prepared]
             self.messages.append(response)
-            if not calls:
+            if not prepared:
                 if not response.get("content"):
                     print("The model returned an empty response.")
                 return
 
-            for call in calls:
-                call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:12]}")
-                if tool_count >= MAX_TOOL_CALLS:
-                    result = "Tool-call limit reached for this turn. Summarize the work completed so far."
-                else:
-                    tool_count += 1
-                    result = self._run_tool_call(call)
-                    remaining = max(0, MAX_TURN_TOOL_CHARS - turn_tool_chars)
-                    if len(result) > remaining:
-                        result = result[:remaining] + "\n[turn tool-output budget reached; ask for a narrower result]"
-                    turn_tool_chars += len(result)
-                self.messages.append({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": _clip(result, MAX_TOOL_RESULT_CHARS),
-                })
+            answered: set[str] = set()
+            try:
+                for stored, arguments, problem in prepared:
+                    name = stored["function"]["name"]
+                    if tool_count >= MAX_TOOL_CALLS:
+                        result = "Tool-call limit reached for this turn. Summarize the work completed so far."
+                    elif problem:
+                        tool_count += 1
+                        print(f"\n[tool: {name}] rejected: {problem}")
+                        result = problem
+                    else:
+                        tool_count += 1
+                        result = self._run_tool_call(name, arguments)
+                    self.messages.append({
+                        "role": "tool",
+                        "tool_call_id": stored["id"],
+                        "content": _clip(result, self.max_tool_result_chars),
+                    })
+                    answered.add(stored["id"])
+            except KeyboardInterrupt:
+                # Every tool call in history needs a result, or the next request is malformed.
+                for stored, _, _ in prepared:
+                    if stored["id"] not in answered:
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": stored["id"],
+                            "content": "Interrupted by the user before this tool finished.",
+                        })
+                raise
 
             if tool_count >= MAX_TOOL_CALLS:
-                print("\nTool-call limit reached; asking the model for a summary.")
-                printer = _StreamPrinter(allowed_tools=allowed_tools, show_thinking=(self.thinking_display == "show"))
-                thinking_header_printed = False
-                try:
-                    final = self.model.stream_chat(
-                        self.messages,
-                        [],
-                        handle_text,
-                        on_thought=thought_cb,
-                    )
-                except ModelError as exc:
-                    err_text = str(exc).lower()
-                    if any(k in err_text for k in ("context", "exceed", "token", "400", "parse error", "closing quote")):
-                        self._emergency_compress_context()
-                        final = self.model.stream_chat(
-                            self.messages,
-                            [],
-                            handle_text,
-                            on_thought=thought_cb,
-                        )
-                    else:
-                        raise
-                if thinking_header_printed:
-                    color = is_color_enabled()
-                    muted = "\x1b[90m" if color else ""
-                    reset = "\x1b[0m" if color else ""
-                    sys.stdout.write(f"{reset}\n{muted}└────────────────────────────────────────{reset}\n\n")
-                    sys.stdout.flush()
-                printer.finish()
-                if printer.visible:
-                    print()
-                _print_performance(final.pop("_metrics", {}))
-                final = _read_legacy_qwen_tool_calls(final, valid_names=allowed_tools)
-                final.pop("_finish_reason", None)
-                if final.get("tool_calls"):
-                    print("The model requested another tool after the limit. Ask me to continue if work remains.")
-                else:
-                    self.messages.append(final)
+                self._finish_after_tool_limit(tools, allowed)
                 return
 
         print(f"\nStopped after {MAX_TOOL_ROUNDS} tool rounds. Review the work so far, then ask me to continue.")
 
-    def _run_tool_call(self, call: dict[str, Any]) -> str:
-        function = call.get("function") or {}
-        name = function.get("name")
-        if not isinstance(name, str):
-            return "Tool call was rejected: missing function name."
-        raw_arguments = function.get("arguments", "{}")
+    def _complete(
+        self,
+        tools: list[dict[str, Any]],
+        allowed: set[str],
+        user_text: str,
+        *,
+        tool_choice: str = "auto",
+        infer_writes: bool = True,
+        fit: bool = True,
+    ) -> tuple[dict[str, Any], str | None]:
+        if fit:
+            self._fit_context()
         try:
-            arguments = raw_arguments if isinstance(raw_arguments, dict) else json.loads(raw_arguments)
-        except (json.JSONDecodeError, TypeError) as exc:
-            return f"Tool call {name} was rejected: arguments were not valid JSON ({exc})."
-        if not isinstance(arguments, dict):
-            return f"Tool call {name} was rejected: arguments must be a JSON object."
+            response = self._stream(tools, allowed, tool_choice)
+        except ContextOverflowError as exc:
+            if not fit:
+                raise
+            self._calibrate(exc.prompt_tokens)
+            self._notice("[Context window full: compacting older turns and retrying...]")
+            if not self._compact(target=self.context_length // 2):
+                raise
+            response = self._stream(tools, allowed, tool_choice)
+        response = _read_legacy_qwen_tool_calls(
+            response,
+            valid_names=allowed,
+            user_prompt=user_text,
+            path_exists=self._path_exists if infer_writes else None,
+        )
+        return response, response.pop("_finish_reason", None)
 
+    def _stream(self, tools: list[dict[str, Any]], allowed: set[str], tool_choice: str) -> dict[str, Any]:
+        printer = _StreamPrinter(allowed_tools=allowed, show_thinking=self.thinking_display == "show")
+        try:
+            response = self.model.stream_chat(
+                self.messages,
+                tools,
+                printer.feed,
+                on_thought=printer.thought if self.thinking_display == "show" else None,
+                prompt_tokens=self.estimate_prompt_tokens(),
+                tool_choice=tool_choice,
+            )
+        finally:
+            printer.finish()
+            if printer.visible:
+                print()
+        metrics = response.pop("_metrics", {})
+        self._record_usage(metrics, len(self.messages) + 1)
+        _print_performance(
+            metrics,
+            used_tokens=self._known_tokens,
+            context_length=self.context_length,
+            draft_label="MTP" if self.model.tuning.speculative == "draft-mtp" else "draft",
+        )
+        return response
+
+    def _continue_truncated(
+        self,
+        response: dict[str, Any],
+        tools: list[dict[str, Any]],
+        allowed: set[str],
+        user_text: str,
+    ) -> tuple[dict[str, Any], str | None]:
+        content = str(response.get("content") or "")
+        finish_reason: str | None = "length"
+        for attempt in (1, 2):
+            self._notice(f"[Output limit reached — auto-continuing ({attempt}/2)...]")
+            self._fit_context()
+            self.messages += [
+                {"role": "assistant", "content": content[-800:]},
+                {"role": "user", "content": CONTINUE_PROMPT},
+            ]
+            try:
+                continuation, finish_reason = self._complete(tools, allowed, user_text, infer_writes=False, fit=False)
+            except ModelError as exc:
+                self._notice(f"[Could not continue: {_terminal_safe(str(exc))[:200]}]")
+                finish_reason = None
+                break
+            finally:
+                del self.messages[-2:]
+                self._invalidate_usage()
+            content += str(continuation.get("content") or "")
+            if continuation.get("tool_calls"):
+                response["tool_calls"] = continuation["tool_calls"]
+                break
+            if finish_reason != "length":
+                break
+        response["content"] = content
+        if not response.get("tool_calls"):
+            response = _read_legacy_qwen_tool_calls(
+                response, valid_names=allowed, user_prompt=user_text, path_exists=self._path_exists
+            )
+            response.pop("_finish_reason", None)
+        return response, finish_reason
+
+    def _finish_after_tool_limit(self, tools: list[dict[str, Any]], allowed: set[str]) -> None:
+        print("\nTool-call limit reached; asking the model for a summary.")
+        # Same tools with tool_choice "none" keeps the prompt identical, so the KV cache is reused.
+        response, _ = self._complete(tools, allowed, "", tool_choice="none", infer_writes=False)
+        if response.pop("tool_calls", None):
+            print("The model requested another tool after the limit. Ask me to continue if work remains.")
+            if not response.get("content"):
+                self._invalidate_usage()
+                return
+        self.messages.append(response)
+
+    def _run_tool_call(self, name: str, arguments: dict[str, Any]) -> str:
         self._announce_tool(name, arguments)
         try:
-            if name in {"web_search", "open_url"}:
+            if name in WEB_TOOL_NAMES:
                 if not self.web_enabled:
-                    raise ToolError("Web tools are disabled. The user can enable them with /web on.")
+                    raise ToolError("Web tools are disabled. The user can enable them with /web auto.")
                 result = self.web_tools.dispatch(name, arguments)
             else:
                 result = self.tools.dispatch(name, arguments)
-            if name in {"run_command", "web_search", "open_url"}:
-                print("\nTool result:\n" + _terminal_safe(_clip(result, 5000)))
-            else:
-                print(f"[tool result: {len(result):,} characters]")
-            return result
         except (ToolError, OSError, ValueError, TypeError) as exc:
             safe_error = _terminal_safe(str(exc))
             print(f"Tool error: {safe_error}")
@@ -608,113 +686,177 @@ class LocalAgent:
             safe_error = _terminal_safe(f"{type(exc).__name__}: {exc}")
             print(f"Tool failed: {safe_error}")
             return f"Tool failed: {safe_error}"
+        if name in {"run_command", "web_search", "open_url"}:
+            print("\nTool result:\n" + _terminal_safe(_clip(result, 5000)))
+        else:
+            print(f"[tool result: {len(result):,} characters]")
+        return result
+
+    def _path_exists(self, path_str: str) -> bool:
+        try:
+            return self.tools._safe_path(path_str).exists()
+        except ToolError:
+            return True  # Unusable paths count as existing, so nothing is inferred for them.
 
     @staticmethod
     def _announce_tool(name: str, arguments: dict[str, Any]) -> None:
         compact = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
         if len(compact) > 700:
             compact = compact[:700] + "…"
-        print(f"\n[tool: {name}] { _terminal_safe(compact) }")
+        print(f"\n[tool: {name}] {_terminal_safe(compact)}")
 
-    def _estimate_tokens(self) -> int:
-        total_chars = 0
-        for m in self.messages:
-            content = m.get("content") or ""
-            total_chars += len(content)
-            for tc in m.get("tool_calls") or []:
-                fn = tc.get("function") or {}
-                total_chars += len(fn.get("name") or "") + len(fn.get("arguments") or "")
-        return (total_chars // 3) + (len(self.messages) * 4)
+    @staticmethod
+    def _notice(text: str) -> None:
+        muted, reset = ("\x1b[90m", "\x1b[0m") if is_color_enabled() else ("", "")
+        print(f"\n{muted}{text}{reset}")
 
-    def _auto_compress_context(self) -> None:
-        if len(self.messages) <= 4:
-            return
 
-        system_msg = self.messages[0]
-        older_turns = self.messages[1:-4]
-        if not older_turns:
-            return
+# ── History helpers ──────────────────────────────────────────────────
 
-        actions: list[str] = []
-        user_goals: list[str] = []
-        for m in older_turns:
-            role = m.get("role")
-            content = str(m.get("content") or "")
-            if role == "user" and not content.startswith("["):
-                first_line = content.strip().splitlines()[0]
-                if len(first_line) > 80:
-                    first_line = first_line[:77] + "..."
-                user_goals.append(first_line)
-            for tc in m.get("tool_calls") or []:
-                fn = tc.get("function") or {}
-                name = fn.get("name")
-                args = fn.get("arguments") or ""
-                if name == "write_file":
-                    try:
-                        parsed = json.loads(args) if isinstance(args, str) else args
-                        path = parsed.get("path") or ""
-                        actions.append(f"Created/edited '{path}'")
-                    except Exception:
-                        pass
-                elif name == "run_command":
-                    try:
-                        parsed = json.loads(args) if isinstance(args, str) else args
-                        cmd = parsed.get("command") or ""
-                        actions.append(f"Ran '{cmd[:40]}'")
-                    except Exception:
-                        pass
 
-        summary_lines = ["[Context: older conversation history auto-compressed to preserve 8K token budget]"]
-        if user_goals:
-            summary_lines.append("Goals tracked: " + " → ".join(user_goals[-3:]))
-        if actions:
-            unique_actions = list(dict.fromkeys(actions))[-6:]
-            summary_lines.append("Actions completed: " + "; ".join(unique_actions))
-        summary_lines.append("Continuing seamlessly with active task.")
+def _approx_tokens(messages: list[dict[str, Any]]) -> int:
+    chars = 0
+    for message in messages:
+        chars += len(str(message.get("content") or "")) + len(str(message.get("reasoning_content") or ""))
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            chars += len(str(function.get("name") or "")) + len(str(function.get("arguments") or ""))
+    return chars // CHARS_PER_TOKEN + 8 * len(messages)
 
-        compressed_block = {
-            "role": "system",
-            "content": "\n".join(summary_lines),
+
+def _one_line(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def _summarize_messages(messages: list[dict[str, Any]]) -> str:
+    results = {m.get("tool_call_id"): str(m.get("content") or "") for m in messages if m.get("role") == "tool"}
+    earlier = ""
+    requests: list[str] = []
+    changes: list[str] = []
+    commands: list[str] = []
+    last_answer = ""
+    verbs = {"write_file": "wrote", "replace_text": "edited", "delete_file": "deleted"}
+    for message in messages:
+        role = message.get("role")
+        content = str(message.get("content") or "").strip()
+        if role == "user":
+            if content.startswith(SUMMARY_MARKER):
+                earlier = content[len(SUMMARY_MARKER):].strip()
+            elif content:
+                requests.append(_one_line(content, 120))
+        elif role == "assistant":
+            if content and content != SUMMARY_ACK:
+                last_answer = content
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                name = function.get("name")
+                try:
+                    args = json.loads(function.get("arguments") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(args, dict):
+                    continue
+                outcome = results.get(call.get("id"), "")
+                if name in verbs and args.get("path") and outcome.startswith(("Wrote", "Deleted")):
+                    changes.append(f"{verbs[name]} {args['path']}")
+                elif name == "run_command" and args.get("command") and outcome.startswith("Exit code"):
+                    commands.append(f"{_one_line(str(args['command']), 80)} ({outcome.splitlines()[0].lower()})")
+
+    lines = [f"{SUMMARY_MARKER} Older turns were removed to free context space. Key points so far:"]
+    if earlier:
+        lines.append("Before that: " + _one_line(earlier, 600))
+    if requests:
+        lines.append("User requests: " + " | ".join(requests[-6:]))
+    if changes:
+        lines.append("Files changed: " + "; ".join(list(dict.fromkeys(changes))[-12:]))
+    if commands:
+        lines.append("Commands run: " + "; ".join(list(dict.fromkeys(commands))[-6:]))
+    if last_answer:
+        lines.append("Last answer: " + _one_line(last_answer, 400))
+    return "\n".join(lines)
+
+
+def _clean_history(raw: Any) -> list[dict[str, Any]]:
+    """Validate saved messages so a stale or damaged session cannot break the chat template."""
+    if not isinstance(raw, list):
+        return []
+    cleaned: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        content = content if isinstance(content, str) else ("" if content is None else str(content))
+        if role == "system":
+            if cleaned and content:
+                # Older versions stored compaction notes as system messages mid-conversation.
+                cleaned.append({"role": "user", "content": f"{SUMMARY_MARKER} {content}"})
+                cleaned.append({"role": "assistant", "content": SUMMARY_ACK})
+        elif role == "user":
+            cleaned.append({"role": "user", "content": content})
+        elif role == "assistant":
+            message: dict[str, Any] = {"role": "assistant", "content": content}
+            reasoning = item.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                message["reasoning_content"] = reasoning
+            raw_calls = item.get("tool_calls")
+            calls = [stored for stored, _, _ in _prepare_tool_calls(raw_calls if isinstance(raw_calls, list) else [], truncated=False)]
+            if calls:
+                message["tool_calls"] = calls
+            cleaned.append(message)
+        elif role == "tool":
+            cleaned.append({"role": "tool", "tool_call_id": str(item.get("tool_call_id") or ""), "content": content})
+    return cleaned
+
+
+# ── Tool-call parsing ────────────────────────────────────────────────
+
+
+def _prepare_tool_calls(
+    calls: list[Any],
+    *,
+    truncated: bool,
+) -> list[tuple[dict[str, Any], dict[str, Any], str | None]]:
+    """Normalize tool calls before they enter history.
+
+    Arguments that are not a JSON object (for example a write_file call cut off at the output
+    limit) are stored as {} with an explanatory result. Kept verbatim, they make llama-server
+    reject every later request with "Failed to parse tool call arguments as JSON".
+    """
+    prepared: list[tuple[dict[str, Any], dict[str, Any], str | None]] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str) or not name:
+            continue
+        raw = function.get("arguments", "{}")
+        arguments: dict[str, Any] | None = raw if isinstance(raw, dict) else None
+        if arguments is None:
+            try:
+                parsed = json.loads(raw or "{}") if isinstance(raw, str) else None
+            except json.JSONDecodeError:
+                parsed = None
+            arguments = parsed if isinstance(parsed, dict) else None
+        problem = None
+        if arguments is None:
+            if truncated:
+                problem = (
+                    f"The {name} call was cut off because the response hit the output token limit, so its "
+                    "arguments were incomplete and nothing was executed. Write large files in smaller parts: "
+                    "create a shorter version first, then extend it with replace_text."
+                )
+            else:
+                problem = f"The {name} call was rejected: its arguments were not a JSON object. Nothing was executed."
+        stored = {
+            "id": str(call.get("id") or f"call_{uuid.uuid4().hex[:12]}"),
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments or {}, ensure_ascii=False)},
         }
-
-        self.messages = [system_msg, compressed_block] + self.messages[-4:]
-        color = is_color_enabled()
-        muted = "\x1b[90m" if color else ""
-        reset = "\x1b[0m" if color else ""
-        print(f"\n{muted}[Context: Auto-compressed earlier turns to stay within 8K token window]{reset}")
-
-    def _emergency_compress_context(self) -> None:
-        if len(self.messages) <= 2:
-            return
-        system_msg = self.messages[0]
-        latest_turn = self.messages[-2:]
-        for m in latest_turn:
-            content = m.get("content")
-            if isinstance(content, str) and len(content) > 1500:
-                m["content"] = content[:1500] + "\n[truncated for context]"
-        self.messages = [
-            system_msg,
-            {
-                "role": "system",
-                "content": "[Emergency compression applied: older history cleared to fit model context. Proceed with current turn.]",
-            },
-        ] + latest_turn
-
-    def _trim_history(self) -> None:
-        ctx_limit = getattr(self.model, "context_length", 8192)
-        safe_budget = int(ctx_limit * 0.70)
-
-        if self._estimate_tokens() > safe_budget:
-            self._auto_compress_context()
-
-        def size() -> int:
-            return sum(len(str(item.get("content", ""))) for item in self.messages[1:])
-
-        while size() > (safe_budget * 3):
-            next_user = next((index for index in range(2, len(self.messages)) if self.messages[index].get("role") == "user"), None)
-            if next_user is None:
-                break
-            del self.messages[1:next_user]
+        prepared.append((stored, arguments or {}, problem))
+    return prepared
 
 
 def _parse_single_tool_payload(payload: Any, valid_names: set[str] | None = None) -> dict[str, Any] | None:
@@ -773,12 +915,38 @@ def _parse_payload_block(block: str, valid_names: set[str] | None = None) -> lis
     return calls
 
 
+# Fence languages that may be saved under each file extension when inferring a write.
+_FENCE_LANGUAGES = {
+    ".py": {"python", "py", "python3"},
+    ".js": {"javascript", "js", "jsx", "node", "mjs"},
+    ".ts": {"typescript", "ts", "tsx"},
+    ".html": {"html", "htm"},
+    ".css": {"css"},
+    ".json": {"json"},
+    ".sh": {"bash", "sh", "shell", "zsh"},
+    ".ps1": {"powershell", "ps1", "pwsh", "ps"},
+    ".md": {"markdown", "md"},
+    ".yml": {"yaml", "yml"},
+    ".yaml": {"yaml", "yml"},
+    ".txt": {"text", "txt", "plaintext"},
+}
+_PATH_PATTERN = r"([A-Za-z0-9_\-./\\]+\.(?:" + "|".join(ext[1:] for ext in _FENCE_LANGUAGES) + r"))\b"
+
+
 def _detect_unwritten_code_blocks(
     content: str,
     existing_calls: list[dict[str, Any]],
     user_prompt: str = "",
+    path_exists: Callable[[str], bool] | None = None,
 ) -> list[tuple[dict[str, Any], tuple[int, int]]]:
-    """Detect when code in markdown was intended for a file not saved with write_file."""
+    """Turn a markdown code block into write_file when the model clearly meant to create a file.
+
+    Only new files are inferred: an explanation that quotes part of an existing file must never
+    overwrite it. The fence language must also match the extension, so a shell snippet next to
+    "python app.py" is not saved as app.py.
+    """
+    if path_exists is None:
+        return []
     written_files = set()
     for call in existing_calls:
         fn = call.get("function", {})
@@ -788,55 +956,58 @@ def _detect_unwritten_code_blocks(
                 args = raw_args if isinstance(raw_args, dict) else json.loads(raw_args)
                 if "path" in args:
                     written_files.add(Path(args["path"]).name.lower())
-            except Exception:
+            except (TypeError, ValueError):
                 pass
 
-    run_refs = re.findall(r'(?:python|node|bash|powershell|sh)\s+[\'"]?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)[\'"]?', content)
-    file_mentions = re.findall(r'(?:save\s+(?:the\s+)?code\s+to|in|file|create)\s+[`\'"]?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)[`\'"]?', content, re.IGNORECASE)
-
+    run_refs = re.findall(r"(?:python|node|bash|powershell|sh)\s+['\"]?" + _PATH_PATTERN, content)
+    file_mentions = re.findall(
+        r"(?:save\s+(?:the\s+)?code\s+to|in|file|create|named|called)\s+[`'\"]?" + _PATH_PATTERN,
+        content,
+        re.IGNORECASE,
+    )
     if user_prompt:
-        user_mentions = re.findall(r'([a-zA-Z0-9_\-\./\\]+\.(?:py|js|ts|html|css|json|sh|ps1|txt|md|yml|yaml))', user_prompt)
-        file_mentions.extend(user_mentions)
-
+        file_mentions.extend(re.findall(_PATH_PATTERN, user_prompt))
     target_candidates = list(dict.fromkeys(run_refs + file_mentions))
     results: list[tuple[dict[str, Any], tuple[int, int]]] = []
 
-    for match in re.finditer(r"```([a-zA-Z0-9_\-]+)?\s*\n(.*?)```", content, re.DOTALL):
-        lang = (match.group(1) or "").strip().lower()
+    for match in re.finditer(r"```([A-Za-z0-9_+\-]*)[ \t]*\n(.*?)```", content, re.DOTALL):
+        lang = match.group(1).strip().lower()
         code = match.group(2)
-
-        if lang == "json" and any(k in code for k in ('"name"', '"run_command"', '"write_file"')):
+        lines = code.strip().splitlines()
+        if len(lines) < 3:
             continue
-        if len(code.strip().splitlines()) < 3:
+        if lang == "json" and any(k in code for k in ('"name"', '"run_command"', '"write_file"')):
             continue
 
         matched_path = None
-        first_line = code.strip().splitlines()[0]
-        first_line_match = re.search(r'([a-zA-Z0-9_\-\./\\]+\.(?:py|js|ts|html|css|json|sh|ps1))', first_line)
+        first_line_match = re.search(_PATH_PATTERN, lines[0])
         if first_line_match:
             matched_path = first_line_match.group(1)
         else:
-            start_pos = match.start()
-            end_pos = match.end()
-            surrounding = content[max(0, start_pos - 300):start_pos] + " " + content[end_pos:min(len(content), end_pos + 300)]
+            surrounding = content[max(0, match.start() - 300):match.start()] + " " + content[match.end():match.end() + 300]
             for cand in target_candidates:
                 if cand in surrounding or Path(cand).name in surrounding:
                     matched_path = cand
                     break
-            if not matched_path and target_candidates:
+            if not matched_path and len(target_candidates) == 1:
                 matched_path = target_candidates[0]
-
-        if matched_path and Path(matched_path).name.lower() not in written_files:
-            written_files.add(Path(matched_path).name.lower())
-            call = {
-                "id": f"call_{uuid.uuid4().hex[:12]}",
-                "type": "function",
-                "function": {
-                    "name": "write_file",
-                    "arguments": json.dumps({"path": matched_path, "content": code.rstrip() + "\n"}, ensure_ascii=False),
-                },
-            }
-            results.append((call, match.span()))
+        if not matched_path:
+            continue
+        if lang and lang not in _FENCE_LANGUAGES.get(Path(matched_path).suffix.lower(), set()):
+            continue
+        name = Path(matched_path).name.lower()
+        if name in written_files or path_exists(matched_path):
+            continue
+        written_files.add(name)
+        call = {
+            "id": f"call_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": json.dumps({"path": matched_path, "content": code.rstrip() + "\n"}, ensure_ascii=False),
+            },
+        }
+        results.append((call, match.span()))
 
     return results
 
@@ -845,6 +1016,7 @@ def _read_legacy_qwen_tool_calls(
     message: dict[str, Any],
     valid_names: set[str] | None = None,
     user_prompt: str = "",
+    path_exists: Callable[[str], bool] | None = None,
 ) -> dict[str, Any]:
     """Handle JSON, Markdown, or Qwen XML tool output if the backend leaves it in text."""
     if message.get("tool_calls"):
@@ -870,7 +1042,7 @@ def _read_legacy_qwen_tool_calls(
                 args: dict[str, Any] = {}
                 for p_match in parameter_pattern.finditer(f_match.group(2)):
                     key = p_match.group(1).strip()
-                    val = p_match.group(2).strip()
+                    val: Any = p_match.group(2).strip()
                     if key in integer_parameters:
                         try:
                             val = int(val)
@@ -894,75 +1066,63 @@ def _read_legacy_qwen_tool_calls(
         if parsed:
             calls.extend(parsed)
             spans.append((start, end))
+
     # 3. Function call syntax: tool_name({...})
     allowed = valid_names or KNOWN_TOOL_NAMES
-    func_pattern = re.compile(r'\b(' + '|'.join(allowed) + r')\s*\(\s*(\{)', re.DOTALL)
+    func_pattern = re.compile(r"\b(" + "|".join(sorted(allowed)) + r")\s*\(\s*(\{)", re.DOTALL)
     decoder = json.JSONDecoder()
     for match in func_pattern.finditer(content):
         start = match.start()
         tool_name = match.group(1)
         brace_idx = match.start(2)
-        if any(s <= start and start < e for s, e in spans):
+        if any(s <= start < e for s, e in spans):
             continue
         try:
             args, end_idx = decoder.raw_decode(content, brace_idx)
-            if isinstance(args, dict):
-                close_paren_idx = content.find(")", end_idx)
-                full_end = close_paren_idx + 1 if close_paren_idx != -1 else end_idx
-                fence_start = content.rfind("```", max(0, start - 30), start)
-                if fence_start != -1:
-                    fence_end = content.find("```", full_end)
-                    if fence_end != -1 and fence_end - full_end < 10:
-                        start = fence_start
-                        full_end = fence_end + 3
-                calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:12]}",
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": json.dumps(args, ensure_ascii=False)
-                    }
-                })
-                spans.append((start, full_end))
         except json.JSONDecodeError:
-            pass
+            continue
+        if not isinstance(args, dict):
+            continue
+        close_paren_idx = content.find(")", end_idx)
+        full_end = close_paren_idx + 1 if close_paren_idx != -1 else end_idx
+        fence_start = content.rfind("```", max(0, start - 30), start)
+        if fence_start != -1:
+            fence_end = content.find("```", full_end)
+            if fence_end != -1 and fence_end - full_end < 10:
+                start = fence_start
+                full_end = fence_end + 3
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+        spans.append((start, full_end))
 
     # 4. Raw JSON in text if not already inside a code block or XML
     if not calls:
-        decoder = json.JSONDecoder()
         pos = 0
         while pos < len(content):
             next_obj = content.find("{", pos)
             next_arr = content.find("[", pos)
             if next_obj == -1 and next_arr == -1:
                 break
-            candidates = [x for x in (next_obj, next_arr) if x != -1]
-            start_idx = min(candidates)
+            start_idx = min(x for x in (next_obj, next_arr) if x != -1)
             try:
                 data, end_idx = decoder.raw_decode(content, start_idx)
-                sub_calls: list[dict[str, Any]] = []
-                if isinstance(data, list):
-                    for item in data:
-                        c = _parse_single_tool_payload(item, valid_names)
-                        if c:
-                            sub_calls.append(c)
-                elif isinstance(data, dict):
-                    c = _parse_single_tool_payload(data, valid_names)
-                    if c:
-                        sub_calls.append(c)
-                if sub_calls:
-                    calls.extend(sub_calls)
-                    spans.append((start_idx, end_idx))
-                pos = end_idx
             except json.JSONDecodeError:
                 pos = start_idx + 1
-    synthesized = _detect_unwritten_code_blocks(content, calls, user_prompt=user_prompt)
-    if synthesized:
-        synth_calls = [c for c, _ in synthesized]
-        synth_spans = [s for _, s in synthesized]
-        calls = synth_calls + calls
-        spans.extend(synth_spans)
+                continue
+            items = data if isinstance(data, list) else [data]
+            sub_calls = [c for c in (_parse_single_tool_payload(item, valid_names) for item in items) if c]
+            if sub_calls:
+                calls.extend(sub_calls)
+                spans.append((start_idx, end_idx))
+            pos = end_idx
 
+    synthesized = _detect_unwritten_code_blocks(content, calls, user_prompt=user_prompt, path_exists=path_exists)
+    if synthesized:
+        calls = [c for c, _ in synthesized] + calls
+        spans.extend(s for _, s in synthesized)
 
     if calls:
         cleaned_content = content
@@ -975,164 +1135,189 @@ def _read_legacy_qwen_tool_calls(
     return message
 
 
+# ── Streaming display ────────────────────────────────────────────────
+
+
 class _StreamPrinter:
-    """Stream user-facing text while suppressing raw tool-call markup."""
+    """Stream answer text and reasoning while hiding raw tool-call markup.
+
+    Ordinary code blocks stream as they arrive; only a fence that could hold a JSON or XML
+    tool call is held back until it closes, then shown unless it parses as a tool call.
+    """
+
+    _MARKERS = ("<think>", "<tool_call>", "```")
 
     def __init__(self, allowed_tools: set[str] | None = None, show_thinking: bool = True) -> None:
         self.allowed_tools = allowed_tools or KNOWN_TOOL_NAMES
         self.show_thinking = show_thinking
         self.buffer = ""
-        self.suppressing = False
+        self.suppress_until = ""
         self.in_think = False
-        self.closer = ""
+        self.in_code = False
+        self.thinking_open = False
         self.visible = False
 
+    def thought(self, chunk: str) -> None:
+        """Reasoning delivered separately by the server (reasoning_content)."""
+        self._open_thinking()
+        self._write(chunk)
+
     def feed(self, value: str) -> None:
+        if self.thinking_open and not self.in_think:
+            self._close_thinking()
         self.buffer += value
         self._drain(final=False)
 
     def finish(self) -> None:
-        if self.in_think:
-            self._emit_thought(self.buffer)
-            self._finish_thought()
-            self.buffer = ""
-            self.in_think = False
         self._drain(final=True)
+        self._close_thinking()
+
+    def _write(self, value: str) -> None:
+        if value:
+            sys.stdout.write(_terminal_safe(value))
+            sys.stdout.flush()
 
     def _emit(self, value: str) -> None:
         if value:
-            sys.stdout.write(_terminal_safe(value))
-            sys.stdout.flush()
+            self._write(value)
             self.visible = True
 
-    def _start_thought(self) -> None:
+    def _open_thinking(self) -> None:
+        if self.thinking_open:
+            return
         color = is_color_enabled()
-        cyan = "\x1b[96m" if color else ""
-        muted = "\x1b[90m" if color else ""
-        reset = "\x1b[0m" if color else ""
+        cyan, muted, reset = ("\x1b[96m", "\x1b[90m", "\x1b[0m") if color else ("", "", "")
         sys.stdout.write(f"\n{cyan}┌─ Thinking Process{reset}\n{muted}")
         sys.stdout.flush()
+        self.thinking_open = True
 
-    def _emit_thought(self, value: str) -> None:
-        if value:
-            sys.stdout.write(_terminal_safe(value))
-            sys.stdout.flush()
-
-    def _finish_thought(self) -> None:
+    def _close_thinking(self) -> None:
+        if not self.thinking_open:
+            return
         color = is_color_enabled()
-        muted = "\x1b[90m" if color else ""
-        reset = "\x1b[0m" if color else ""
-        sys.stdout.write(f"{reset}\n{muted}└────────────────────────────────────────{reset}\n\n")
+        muted, reset = ("\x1b[90m", "\x1b[0m") if color else ("", "")
+        sys.stdout.write(f"{reset}\n{muted}└{'─' * 40}{reset}\n\n")
         sys.stdout.flush()
+        self.thinking_open = False
+
+    def _hold_tail(self, keep: int, writer: Callable[[str], None]) -> None:
+        """Write all but the last `keep` characters, which may hold a partial marker."""
+        if len(self.buffer) > keep:
+            writer(self.buffer[:-keep])
+            self.buffer = self.buffer[-keep:]
 
     def _drain(self, final: bool) -> None:
         while self.buffer:
+            if self.suppress_until:
+                end = self.buffer.find(self.suppress_until)
+                if end >= 0:
+                    self.buffer = self.buffer[end + len(self.suppress_until):]
+                    self.suppress_until = ""
+                    continue
+                if final:
+                    self.buffer = ""
+                    return
+                self._hold_tail(len(self.suppress_until) - 1, lambda _: None)
+                return
+
             if self.in_think:
                 end = self.buffer.find("</think>")
                 if end >= 0:
-                    think_text = self.buffer[:end]
-                    self._emit_thought(think_text)
-                    self._finish_thought()
+                    self._write(self.buffer[:end])
                     self.buffer = self.buffer[end + len("</think>"):]
                     self.in_think = False
+                    self._close_thinking()
                     continue
                 if final:
-                    self._emit_thought(self.buffer)
-                    self._finish_thought()
+                    self._write(self.buffer)
                     self.buffer = ""
-                    self.in_think = False
                     return
-                keep = len("</think>") - 1
-                if len(self.buffer) > keep:
-                    self._emit_thought(self.buffer[:-keep])
-                    self.buffer = self.buffer[-keep:]
+                self._hold_tail(len("</think>") - 1, self._write)
                 return
 
-            if self.suppressing:
-                end = self.buffer.find(self.closer)
+            if self.in_code:
+                end = self.buffer.find("```")
                 if end >= 0:
-                    self.buffer = self.buffer[end + len(self.closer):]
-                    self.suppressing = False
-                    self.closer = ""
+                    self._emit(self.buffer[:end + 3])
+                    self.buffer = self.buffer[end + 3:]
+                    self.in_code = False
                     continue
                 if final:
+                    self._emit(self.buffer)
                     self.buffer = ""
                     return
-                keep = len(self.closer) - 1
-                if keep > 0 and len(self.buffer) > keep:
-                    self.buffer = self.buffer[-keep:]
+                self._hold_tail(2, self._emit)
                 return
 
-            idx_think = self.buffer.find("<think>")
-            if idx_think >= 0:
-                self._emit(self.buffer[:idx_think])
-                self.buffer = self.buffer[idx_think + len("<think>"):]
+            positions = [(self.buffer.find(marker), marker) for marker in self._MARKERS]
+            found = [(index, marker) for index, marker in positions if index >= 0]
+            if not found:
+                if final:
+                    self._emit(self.buffer)
+                    self.buffer = ""
+                else:
+                    self._hold_tail(len("<tool_call>") - 1, self._emit)
+                return
+
+            index, marker = min(found)
+            self._emit(self.buffer[:index])
+            self.buffer = self.buffer[index:]
+            if marker == "<think>":
+                self.buffer = self.buffer[len(marker):]
                 if self.show_thinking:
-                    self._start_thought()
                     self.in_think = True
+                    self._open_thinking()
                 else:
-                    self.suppressing = True
-                    self.closer = "</think>"
+                    self.suppress_until = "</think>"
+                continue
+            if marker == "<tool_call>":
+                self.buffer = self.buffer[len(marker):]
+                self.suppress_until = "</tool_call>"
                 continue
 
-            idx_xml = self.buffer.find("<tool_call>")
-            if idx_xml >= 0:
-                self._emit(self.buffer[:idx_xml])
-                self.buffer = self.buffer[idx_xml + len("<tool_call>"):]
-                self.suppressing = True
-                self.closer = "</tool_call>"
-                continue
-
-            idx_md = self.buffer.find("```")
-            if idx_md >= 0:
-                after_ticks = self.buffer[idx_md:]
-                closing_idx = after_ticks.find("```", 3)
-                if closing_idx >= 0:
-                    full_block = after_ticks[:closing_idx + 3]
-                    is_tool = any(f'"{name}"' in full_block for name in self.allowed_tools)
-                    if is_tool:
-                        self._emit(self.buffer[:idx_md])
-                        self.buffer = self.buffer[idx_md + len(full_block):]
-                        continue
-                    else:
-                        self._emit(self.buffer[:idx_md + len(full_block)])
-                        self.buffer = self.buffer[idx_md + len(full_block):]
-                        continue
-                else:
-                    is_tool = any(f'"{name}"' in after_ticks for name in self.allowed_tools)
-                    if is_tool:
-                        self._emit(self.buffer[:idx_md])
-                        self.buffer = after_ticks[3:]
-                        self.suppressing = True
-                        self.closer = "```"
-                        continue
-                    if final:
-                        self._emit(self.buffer)
-                        self.buffer = ""
-                        return
-                    self._emit(self.buffer[:idx_md])
-                    self.buffer = self.buffer[idx_md:]
-                    return
-
-            if final:
-                self._emit(self.buffer)
-                self.buffer = ""
+            # A code fence: decide whether it may contain a tool call.
+            header_end = self.buffer.find("\n")
+            if header_end < 0:
+                if final:
+                    self._emit(self.buffer)
+                    self.buffer = ""
                 return
-
-            keep = 8
-            if len(self.buffer) > keep:
-                self._emit(self.buffer[:-keep])
-                self.buffer = self.buffer[-keep:]
-            return
+            lang = self.buffer[3:header_end].strip().lower()
+            body = self.buffer[header_end + 1:].lstrip()
+            if lang in {"", "json", "xml", "tool_call"} and (not body or body[0] in "{[<"):
+                if not body and not final:
+                    return
+                closing = self.buffer.find("```", header_end)
+                if closing < 0:
+                    if final:
+                        if not _parse_payload_block(self.buffer[header_end + 1:], self.allowed_tools):
+                            self._emit(self.buffer)
+                        self.buffer = ""
+                    return
+                block = self.buffer[:closing + 3]
+                self.buffer = self.buffer[closing + 3:]
+                inner = block[header_end + 1:-3]
+                if not (_parse_payload_block(inner, self.allowed_tools) or "<tool_call>" in inner):
+                    self._emit(block)
+                continue
+            self._emit(self.buffer[:header_end + 1])
+            self.buffer = self.buffer[header_end + 1:]
+            self.in_code = True
 
 
 def _clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
-    return text[:limit] + "\n[result capped]"
+    return text[:limit] + f"\n[output capped at {limit:,} characters; request a narrower range or search instead]"
 
 
-def _print_performance(metrics: dict[str, Any]) -> None:
+def _print_performance(
+    metrics: dict[str, Any],
+    *,
+    used_tokens: int | None = None,
+    context_length: int = 0,
+    draft_label: str = "draft",
+) -> None:
     timings = metrics.get("timings") or {}
     usage = metrics.get("usage") or {}
     parts: list[str] = []
@@ -1146,9 +1331,47 @@ def _print_performance(metrics: dict[str, Any]) -> None:
     draft_n = timings.get("draft_n")
     draft_accepted = timings.get("draft_n_accepted")
     if isinstance(draft_n, (int, float)) and draft_n > 0 and isinstance(draft_accepted, (int, float)):
-        parts.append(f"MTP accept {100 * draft_accepted / draft_n:.0f}%")
+        parts.append(f"{draft_label} accept {100 * draft_accepted / draft_n:.0f}%")
+    if used_tokens and context_length:
+        parts.append(f"context {used_tokens / 1024:.1f}K/{context_length // 1024}K")
     if parts:
-        print("[" + " · ".join(parts) + "]")
+        muted, reset = ("\x1b[90m", "\x1b[0m") if is_color_enabled() else ("", "")
+        print(f"{muted}[" + " · ".join(parts) + f"]{reset}")
+
+
+def _set_console_title(model_name: str) -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetConsoleTitleW(f"Local Assistant | {model_name}")
+    except (AttributeError, OSError):
+        pass
+
+
+# ── Interactive CLI ──────────────────────────────────────────────────
+
+
+def _choose_model(agent: LocalAgent) -> None:
+    options: list[tuple[str, str, str]] = []
+    for path in discover_models(PROJECT_ROOT):
+        try:
+            info = inspect_model(path)
+        except OSError:
+            continue
+        traits = [f"{info.size_gib:.1f} GB"]
+        if info.reasoning:
+            traits.append("reasoning")
+        if info.mtp:
+            traits.append("built-in MTP")
+        options.append((model_alias(path, PROJECT_ROOT) or str(path), info.name, " · ".join(traits)))
+    current = model_alias(agent.model.model_file, PROJECT_ROOT) or str(agent.model.model_file)
+    selected = select_menu("Select Local Model", options, current=current) if options else None
+    if selected:
+        agent.switch_model(selected)
+    else:
+        agent.show_model_details()
 
 
 def interactive_cli(
@@ -1156,12 +1379,12 @@ def interactive_cli(
     workspace: Path,
     allow_web: bool = True,
     thinking_display: str = "show",
+    options: RuntimeOptions | None = None,
 ) -> None:
-    agent = LocalAgent(model, workspace, allow_web=allow_web, thinking_display=thinking_display)
-    if agent.load_session():
-        print("Resumed the last saved conversation for this workspace.\n")
-    else:
-        print("No saved conversation found for this workspace.\n")
+    agent = LocalAgent(model, workspace, allow_web=allow_web, thinking_display=thinking_display, options=options)
+    restored = agent.load_session()
+    if restored:
+        print(f"Resumed the saved conversation for this workspace ({restored} messages). Type /new to start fresh.\n")
     print("Ready. Type / to browse commands · Ctrl+C interrupts the current turn.\n")
 
     try:
@@ -1194,8 +1417,9 @@ def interactive_cli(
                     print("Could not save the conversation to disk.\n")
                 continue
             if command in {"/resume", "/restore"}:
-                if agent.load_session():
-                    print("Resumed the last saved conversation.\n")
+                restored = agent.load_session()
+                if restored:
+                    print(f"Resumed the last saved conversation ({restored} messages).\n")
                 else:
                     print("No saved conversation was found for this workspace.\n")
                 continue
@@ -1227,46 +1451,10 @@ def interactive_cli(
                     print(f"Path is not a directory: {new_path}\n")
                 continue
             if command == "/model":
-                project_root = Path(__file__).resolve().parents[1]
-                models_dir = project_root / "models"
-                available_options: list[tuple[str, str, str]] = []
-
-                coder_7b_file = models_dir / "Qwen2.5-Coder-7B" / "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
-                default_27b_file = models_dir / "Qwen3.8-27B-HF" / "Qwen3.8-27B-UD-Q4_K_XL.gguf"
-
-                if coder_7b_file.is_file():
-                    available_options.append(("7b", "Qwen 2.5 Coder 7B", "Fast coding (100% RTX 4050 VRAM · 35-45 tok/s)"))
-                if default_27b_file.is_file():
-                    available_options.append(("27b", "Qwen 3.8 27B", "Deep reasoning (16 layers GPU + Zen 4 AVX-512 CPU · 2.4 tok/s)"))
-
-                if models_dir.is_dir():
-                    for gguf in models_dir.rglob("*.gguf"):
-                        if "mmproj" in gguf.name.lower() or "mtp" in gguf.name.lower():
-                            continue
-                        if gguf.stat().st_size < 100 * 1024 * 1024:
-                            continue
-                        if gguf.resolve() not in (coder_7b_file.resolve(), default_27b_file.resolve()):
-                            size_gb = gguf.stat().st_size / (1024**3)
-                            name = display_model_name(gguf)
-                            available_options.append((str(gguf), name, f"Custom model ({size_gb:.1f} GB)"))
-
-                active_stem = agent.model.model_file.name.lower()
-                current_id = "27b" if ("27b" in active_stem or "qwen3" in active_stem) else ("7b" if "7b" in active_stem else str(agent.model.model_file))
-
-                selected = select_menu("Select Local Model", available_options, current=current_id)
-                if selected:
-                    agent.switch_model(selected)
-                else:
-                    model_name = display_model_name(agent.model.model_file)
-                    print(f"Active model : {model_name}")
-                    print(f"Model file   : {agent.model.model_file}")
-                    print(f"Context size : {agent.model.context_length // 1024}K tokens")
-                    print(f"Reasoning    : {agent.model.reasoning_effort} (budget: {agent.model.thinking_budget_tokens})")
-                    print("Switch anytime with /model, /model 7b, or /model 27b.\n")
+                _choose_model(agent)
                 continue
             if command.startswith("/model "):
-                target_arg = user_text[len("/model"):].strip()
-                agent.switch_model(target_arg)
+                agent.switch_model(user_text[len("/model"):].strip())
                 continue
             if command in {"/think", "/thinking", "/thought"}:
                 selected = select_menu(
@@ -1284,32 +1472,31 @@ def interactive_cli(
                 continue
             if command.startswith(("/think ", "/thinking ")):
                 prefix_len = len("/thinking ") if command.startswith("/thinking ") else len("/think ")
-                arg = user_text[prefix_len:].strip()
-                agent.set_thinking_display(arg)
+                agent.set_thinking_display(user_text[prefix_len:].strip())
                 print()
                 continue
             if command in {"/context", "/tokens"}:
-                total_chars = sum(len(m.get("content") or "") for m in agent.messages)
-                approx_tokens = total_chars // 4
-                ctx_limit = agent.model.context_length
-                pct = (approx_tokens / ctx_limit) * 100 if ctx_limit else 0
-                model_name = display_model_name(agent.model.model_file)
-                print(f"\nContext Window Usage:")
-                print(f"  Model         : {model_name}")
+                used = agent.estimate_prompt_tokens()
+                ctx_limit = agent.context_length
+                pct = (used / ctx_limit) * 100 if ctx_limit else 0
+                approx = "" if agent.usage_is_exact else "~"
+                print("\nContext Window Usage:")
+                print(f"  Model         : {agent.model.info.name}")
                 print(f"  Context limit : {ctx_limit:,} tokens ({ctx_limit // 1024}K)")
-                print(f"  Used (approx) : ~{approx_tokens:,} tokens ({pct:.1f}%)")
-                print(f"  Messages      : {len(agent.messages)} turns in history")
+                print(f"  Used          : {approx}{used:,} tokens ({pct:.1f}%)" + ("" if approx else " · exact, from the server"))
+                print(f"  Messages      : {len(agent.messages)} in history")
                 print(f"  Thinking mode : {agent.thinking_display}")
                 print(f"  Permission    : {agent.tools.permission_mode}")
                 print(f"  Web research  : {'enabled' if agent.web_enabled else 'off'}")
-                print(f"\nTip: Type /compact to trim older turns, or /new to start a fresh chat.\n")
+                print("\nOlder turns are summarized automatically when the window fills. /compact does it now; /new starts fresh.\n")
                 continue
             if command in {"/compact", "/compress"}:
-                if len(agent.messages) <= 3:
+                result = agent.compact_history()
+                if result is None:
                     print("Conversation history is already minimal; nothing to compact.\n")
-                    continue
-                count = agent.compact_history()
-                print(f"✓ Compacted conversation history ({count} messages retained in active context).\n")
+                else:
+                    before, after = result
+                    print(f"✓ Compacted conversation history: ~{before:,} → ~{after:,} tokens.\n")
                 continue
             if command in {"/cls", "/clear-screen"}:
                 sys.stdout.write("\x1b[2J\x1b[H")
@@ -1367,20 +1554,21 @@ def interactive_cli(
                 print()
                 continue
             if command == "/effort":
+                budget = agent.model.thinking_budget_tokens
                 selected = select_menu(
                     "Reasoning Effort",
                     [
-                        ("none", "none", "Fast, direct answers — no thinking tokens"),
-                        ("low", "low", "Light reasoning"),
+                        ("none", "none", "Fast, direct answers — thinking disabled"),
+                        ("low", "low", "Brief, focused thinking"),
                         ("medium", "medium", "Balanced reasoning (default)"),
                         ("high", "high", "Deep reasoning — thorough deliberation"),
-                        ("budget", "budget", f"Custom token budget (current: {agent.model.thinking_budget_tokens})"),
+                        ("budget", "budget", f"Custom token budget (current: {budget or 'no limit'})"),
                     ],
                     current=agent.model.reasoning_effort,
                 )
                 if selected == "budget":
                     try:
-                        val = input(f"\nEnter thinking budget in tokens (0-8192, current {agent.model.thinking_budget_tokens}): ").strip()
+                        val = input(f"\nEnter thinking budget in tokens (0 = no limit, up to 8192; current {budget}): ").strip()
                         if val.isdigit():
                             agent.set_thinking_budget(int(val))
                         else:
@@ -1418,7 +1606,7 @@ def interactive_cli(
                 if len(pieces) == 2 and pieces[1].isdigit():
                     agent.set_thinking_budget(int(pieces[1]))
                 else:
-                    print("Usage: /effort budget N (0 to 8192)")
+                    print("Usage: /effort budget N (0 = no limit, up to 8192)")
                 print()
                 continue
             if command.startswith("/"):
@@ -1435,6 +1623,7 @@ def interactive_cli(
             except ToolError as exc:
                 print(f"\nInput error: {_terminal_safe(str(exc))}\n")
             except KeyboardInterrupt:
+                agent.save_session()
                 print("\nTurn interrupted. The local server will stop if you exit.")
     finally:
         agent.model.close()
@@ -1444,38 +1633,31 @@ def launch_agent(
     workspace: Path,
     server_exe: Path,
     model_file: Path,
-    context_length: int,
+    options: RuntimeOptions,
     allow_web: bool,
-    cpu_threads: int | None = None,
-    batch_threads: int | None = None,
-    gpu_reserve_mib: int = 1024,
-    kv_cache_type: str = "f16",
-    speculative: str = "none",
+    *,
     reasoning_effort: str = "medium",
     thinking_budget_tokens: int = 512,
-    draft_model_file: Path | None = None,
     thinking_display: str = "show",
 ) -> int:
     terminal_state = enable_terminal_features()
     model: LocalModelServer | None = None
     try:
-        print_welcome(workspace.resolve(), model_file.resolve(), context_length, allow_web)
+        info: ModelInfo = inspect_model(model_file)
+        tuning = plan_runtime(info, options, detect_gpu_memory_mib())
+        print_welcome(workspace.resolve(), info, tuning, allow_web)
+        _set_console_title(info.name)
         model = LocalModelServer(
             server_exe,
-            model_file,
-            context_length=context_length,
-            cpu_threads=cpu_threads,
-            batch_threads=batch_threads,
-            gpu_reserve_mib=gpu_reserve_mib,
-            kv_cache_type=kv_cache_type,
-            speculative=speculative,
+            info,
+            tuning,
             reasoning_effort=reasoning_effort,
             thinking_budget_tokens=thinking_budget_tokens,
-            draft_model_file=draft_model_file,
+            draft_model_file=options.draft_model,
         )
         model.__enter__()
-        interactive_cli(model, workspace, allow_web=allow_web, thinking_display=thinking_display)
-    except ModelError as exc:
+        interactive_cli(model, workspace, allow_web=allow_web, thinking_display=thinking_display, options=options)
+    except (ModelError, ValueError, OSError) as exc:
         print(f"\n{_terminal_safe(str(exc))}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

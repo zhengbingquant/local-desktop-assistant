@@ -12,11 +12,25 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Callable, Any
+from typing import Any, Callable
+
+from .models import ModelInfo, RuntimeTuning
+
+
+MAX_RESPONSE_TOKENS = 4096
 
 
 class ModelError(RuntimeError):
     """Raised when the local inference process cannot serve a response."""
+
+
+class ContextOverflowError(ModelError):
+    """The request no longer fits in the model's context window."""
+
+    def __init__(self, message: str, prompt_tokens: int = 0, context_tokens: int = 0) -> None:
+        super().__init__(message)
+        self.prompt_tokens = prompt_tokens
+        self.context_tokens = context_tokens
 
 
 class _WindowsKillOnCloseJob:
@@ -107,30 +121,23 @@ class LocalModelServer:
     def __init__(
         self,
         server_exe: Path,
-        model_file: Path,
-        context_length: int = 8192,
-        startup_timeout: int = 900,
-        cpu_threads: int | None = None,
-        batch_threads: int | None = None,
-        gpu_reserve_mib: int = 1024,
-        kv_cache_type: str = "f16",
-        speculative: str = "none",
+        model: ModelInfo,
+        tuning: RuntimeTuning,
+        *,
         reasoning_effort: str = "medium",
         thinking_budget_tokens: int = 512,
         draft_model_file: Path | None = None,
+        startup_timeout: int = 900,
     ) -> None:
         self.server_exe = server_exe.resolve()
-        self.model_file = model_file.resolve()
-        self.context_length = context_length
-        self.startup_timeout = startup_timeout
-        self.cpu_threads = cpu_threads
-        self.batch_threads = batch_threads
-        self.gpu_reserve_mib = gpu_reserve_mib
-        self.kv_cache_type = kv_cache_type
-        self.speculative = speculative
+        self.info = model
+        self.model_file = model.path
+        self.tuning = tuning
+        self.context_length = tuning.context_length
         self.reasoning_effort = reasoning_effort
         self.thinking_budget_tokens = thinking_budget_tokens
         self.draft_model_file = draft_model_file.resolve() if draft_model_file else None
+        self.startup_timeout = startup_timeout
         self.process: subprocess.Popen[bytes] | None = None
         self.port: int | None = None
         self.api_key = secrets.token_urlsafe(32)
@@ -150,68 +157,59 @@ class LocalModelServer:
         if self._job is not None:
             self._job.assign(process)
 
-    def __enter__(self) -> "LocalModelServer":
-        if not self.server_exe.is_file():
-            raise ModelError(f"llama-server is missing: {self.server_exe}")
-        if not self.model_file.is_file():
-            raise ModelError(
-                f"The local model is missing: {self.model_file}\n"
-                "Run scripts/download-model.ps1 to download it."
-            )
-        if self.speculative == "draft-mtp":
-            if self.draft_model_file is None or not self.draft_model_file.is_file():
-                raise ModelError("The MTP draft model is missing. Run scripts/download-model.ps1 -MTP first.")
-        elif self.draft_model_file is not None:
-            raise ModelError("A draft model can only be supplied with --speculative draft-mtp.")
-
-        self._temp_dir = tempfile.TemporaryDirectory(prefix="local-assistant-")
-        self._log_file = Path(self._temp_dir.name) / "llama-server.log"
-        self.port = self._free_local_port()
-        model_name_lower = self.model_file.name.lower()
-        is_reasoning = any(tag in model_name_lower for tag in ("qwen3", "deepseek-r1", "reasoning", "thinking"))
+    def command(self) -> list[str]:
+        tuning = self.tuning
         command = [
             str(self.server_exe),
             "--model", str(self.model_file),
             "--host", "127.0.0.1",
             "--port", str(self.port),
             "--api-key", self.api_key,
-            "--ctx-size", str(self.context_length),
+            "--ctx-size", str(tuning.context_length),
             "--parallel", "1",
             "--fit", "on",
-            "--fit-target", str(self.gpu_reserve_mib),
+            "--fit-target", str(tuning.gpu_reserve_mib),
             "--flash-attn", "on",
-            "--batch-size", "256",
-            "--ubatch-size", "128",
-            "--cache-type-k", self.kv_cache_type,
-            "--cache-type-v", self.kv_cache_type,
+            "--batch-size", str(tuning.batch_size),
+            "--ubatch-size", str(tuning.ubatch_size),
+            "--cache-type-k", tuning.kv_cache_type,
+            "--cache-type-v", tuning.kv_cache_type,
             "--jinja",
             "--offline",
             "--no-webui",
             "--no-agent",
+            "--reasoning", "on" if self.info.reasoning else "off",
         ]
-        if is_reasoning:
-            command.extend([
-                "--reasoning", "on",
-                "--reasoning-effort", self.reasoning_effort,
-                "--temp", "1.0",
-                "--top-p", "0.95",
-                "--top-k", "20",
-            ])
-        else:
-            command.extend([
-                "--reasoning", "off",
-                "--temp", "0.2",
-                "--top-p", "0.9",
-                "--top-k", "40",
-            ])
-        if self.cpu_threads is not None:
-            command.extend(["--threads", str(self.cpu_threads)])
-        if self.batch_threads is not None:
-            command.extend(["--threads-batch", str(self.batch_threads)])
-        if self.speculative != "none":
-            command.extend(["--spec-type", self.speculative])
-        if self.draft_model_file is not None:
-            command.extend(["--model-draft", str(self.draft_model_file), "--spec-draft-n-max", "3"])
+        if tuning.cpu_threads is not None:
+            command += ["--threads", str(tuning.cpu_threads)]
+        if tuning.batch_threads is not None:
+            command += ["--threads-batch", str(tuning.batch_threads)]
+        if tuning.speculative != "none":
+            command += ["--spec-type", tuning.speculative]
+        if tuning.speculative == "draft-mtp":
+            command += ["--spec-draft-n-max", str(tuning.draft_max)]
+            if self.draft_model_file is not None:
+                command += ["--model-draft", str(self.draft_model_file)]
+        return command
+
+    def __enter__(self) -> "LocalModelServer":
+        if not self.server_exe.is_file():
+            raise ModelError(
+                f"llama-server is missing: {self.server_exe}\n"
+                "Run .\\scripts\\install-runtime.ps1 to download llama.cpp, or place a build in runtime\\llama.cpp."
+            )
+        if not self.model_file.is_file():
+            raise ModelError(
+                f"The local model is missing: {self.model_file}\n"
+                "Run .\\scripts\\download-model.ps1 to download it."
+            )
+        if self.draft_model_file is not None and not self.draft_model_file.is_file():
+            raise ModelError(f"The draft model is missing: {self.draft_model_file}")
+
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="local-assistant-")
+        self._log_file = Path(self._temp_dir.name) / "llama-server.log"
+        self.port = self._free_local_port()
+        command = self.command()
 
         try:
             if os.name == "nt":
@@ -246,7 +244,7 @@ class LocalModelServer:
                     )
                 try:
                     self._request("GET", "/health", timeout=2)
-                    print("Local model is ready.\n")
+                    print(f"Local model is ready ({time.monotonic() - started:.0f}s).\n")
                     return self
                 except ModelError as exc:
                     message = str(exc)
@@ -259,7 +257,7 @@ class LocalModelServer:
                 if now - last_notice >= 15:
                     print("  Still loading the model...")
                     last_notice = now
-                time.sleep(0.5)
+                time.sleep(0.25)
         except KeyboardInterrupt:
             self.close()
             raise
@@ -310,28 +308,34 @@ class LocalModelServer:
         tools: list[dict[str, Any]],
         on_text: Callable[[str], None],
         on_thought: Callable[[str], None] | None = None,
+        *,
+        prompt_tokens: int | None = None,
+        tool_choice: str = "auto",
     ) -> dict[str, Any]:
-        is_reasoning = any(tag in self.model_file.name.lower() for tag in ("qwen3", "deepseek-r1", "reasoning", "thinking"))
-        # Ensure max_tokens stays safely within the remaining context window room
-        approx_prompt_tokens = sum(len(str(m.get("content") or "")) for m in messages) // 3 + len(messages) * 4
-        remaining_space = max(512, self.context_length - approx_prompt_tokens - 64)
-        max_tokens_val = min(4096, remaining_space)
+        # Leave the rest of the context window for the reply, capped at a sane maximum.
+        room = self.context_length - (prompt_tokens or 0) - 64
         body: dict[str, Any] = {
             "model": self.model_file.stem,
             "messages": messages,
-            "temperature": 1.0 if is_reasoning else 0.2,
-            "top_p": 0.95 if is_reasoning else 0.9,
-            "top_k": 20 if is_reasoning else 40,
-            "max_tokens": max_tokens_val,
+            "temperature": self.info.temperature,
+            "top_p": self.info.top_p,
+            "top_k": self.info.top_k,
+            "max_tokens": max(256, min(MAX_RESPONSE_TOKENS, room)),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if is_reasoning:
-            body["reasoning_effort"] = self.reasoning_effort
-            body["thinking_budget_tokens"] = self.thinking_budget_tokens
+        if self.info.reasoning:
+            if self.reasoning_effort == "none":
+                # llama.cpp treats reasoning_effort "none" as unset, and Qwen templates then
+                # default to their deepest effort. Disabling thinking must use the template switch.
+                body["chat_template_kwargs"] = {"enable_thinking": False}
+            else:
+                body["reasoning_effort"] = self.reasoning_effort
+                if self.thinking_budget_tokens > 0:
+                    body["thinking_budget_tokens"] = self.thinking_budget_tokens
         if tools:
             body["tools"] = tools
-            body["tool_choice"] = "auto"
+            body["tool_choice"] = tool_choice
             body["parallel_tool_calls"] = False
 
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -353,9 +357,14 @@ class LocalModelServer:
         finish_reason: str | None = None
         usage: dict[str, Any] = {}
         timings: dict[str, Any] = {}
-        thought_visible = False
-        content_visible = False
+        status_visible = True
         print("Thinking...", end="", flush=True)
+
+        def clear_status() -> None:
+            nonlocal status_visible
+            if status_visible:
+                print("\r" + " " * 16 + "\r", end="", flush=True)
+                status_visible = False
 
         try:
             with self._opener.open(request, timeout=3600) as response:
@@ -369,10 +378,10 @@ class LocalModelServer:
                     try:
                         chunk = json.loads(data)
                     except json.JSONDecodeError as exc:
-                        raise ModelError(f"Invalid stream data from llama-server: {data[:500]}") from exc
+                        raise ModelError(f"Invalid stream data from llama-server: {_terminal_safe(data[:500])}") from exc
 
                     if chunk.get("error"):
-                        raise ModelError(f"Local model error: {chunk['error']}")
+                        raise _model_error(None, json.dumps({"error": chunk["error"]}))
                     response_id = chunk.get("id") or response_id
                     if isinstance(chunk.get("usage"), dict):
                         usage.update(chunk["usage"])
@@ -388,20 +397,14 @@ class LocalModelServer:
                     if isinstance(thought, str) and thought:
                         reasoning.append(thought)
                         if on_thought is not None:
-                            if not thought_visible:
-                                print("\r" + " " * 16 + "\r", end="", flush=True)
-                                thought_visible = True
+                            clear_status()
                             on_thought(thought)
 
                     text = delta.get("content")
                     if isinstance(text, str) and text:
-                        if not content_visible:
-                            if not thought_visible:
-                                print("\r" + " " * 16 + "\r", end="", flush=True)
-                            content_visible = True
-                        safe = _terminal_safe(text)
-                        content.append(safe)
-                        on_text(safe)
+                        clear_status()
+                        content.append(text)
+                        on_text(text)
 
                     for fragment in delta.get("tool_calls") or []:
                         index = int(fragment.get("index", 0))
@@ -421,17 +424,11 @@ class LocalModelServer:
                             entry["function"]["arguments"] += json.dumps(arguments, ensure_ascii=False)
         except urllib.error.HTTPError as exc:
             detail = exc.read(16_000).decode("utf-8", errors="replace")
-            if exc.code == 500 and ("missing closing quote" in detail or "parse error" in detail):
-                raise ModelError(
-                    "The model's code output hit the response token limit and was cut off mid-tool call.\n"
-                    "Tip: Ask the model to build the project modularly step-by-step or write smaller files."
-                ) from exc
-            raise ModelError(f"Local model returned HTTP {exc.code}: {detail}") from exc
+            raise _model_error(exc.code, detail) from exc
         except (OSError, urllib.error.URLError) as exc:
             raise ModelError(f"Could not get a response from the local model: {exc}") from exc
         finally:
-            if not content_visible and not thought_visible:
-                print("\r" + " " * 16 + "\r", end="", flush=True)
+            clear_status()
 
         result: dict[str, Any] = {"role": "assistant", "content": "".join(content)}
         if finish_reason:
@@ -493,15 +490,45 @@ class LocalModelServer:
         self.close()
 
 
+def _model_error(status: int | None, detail: str) -> ModelError:
+    """Turn an llama-server error body into a ModelError, recognizing context overflows."""
+    message = detail.strip()
+    error: Any = None
+    try:
+        payload = json.loads(detail)
+        if isinstance(payload, dict):
+            error = payload.get("error", payload)
+    except json.JSONDecodeError:
+        pass
+    if isinstance(error, dict):
+        message = str(error.get("message") or message)
+        if error.get("type") == "exceed_context_size_error":
+            return ContextOverflowError(
+                _terminal_safe(message),
+                prompt_tokens=_as_int(error.get("n_prompt_tokens")),
+                context_tokens=_as_int(error.get("n_ctx")),
+            )
+    elif isinstance(error, str):
+        message = error
+    prefix = f"Local model returned HTTP {status}" if status else "Local model error"
+    return ModelError(f"{prefix}: {_terminal_safe(message)[:2000]}")
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+# C0 controls (except newline and tab), DEL, and C1 controls can start terminal escape sequences.
+_CONTROL_ESCAPES = {
+    code: f"\\x{code:02x}"
+    for code in (*range(32), *range(127, 160))
+    if chr(code) not in "\n\t"
+}
+
+
 def _terminal_safe(value: str) -> str:
     """Make model/tool output unable to inject terminal control sequences."""
-    output: list[str] = []
-    for char in value:
-        code = ord(char)
-        if char in "\n\t":
-            output.append(char)
-        elif code < 32 or code == 127:
-            output.append(f"\\x{code:02x}")
-        else:
-            output.append(char)
-    return "".join(output)
+    return value.translate(_CONTROL_ESCAPES)

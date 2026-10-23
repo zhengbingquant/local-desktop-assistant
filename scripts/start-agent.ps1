@@ -1,67 +1,52 @@
 param(
     [string]$WorkspacePath = (Get-Location).Path,
     [string]$ModelPath,
-    [ValidateSet('auto', '7b', '27b', 'coder', 'qwen27b')]
+    [ValidateSet('auto', '27b', '7b', 'qwen27b', 'coder')]
     [string]$Model = 'auto',
-    [ValidateRange(4096, 32768)]
-    [int]$ContextLength = 8192,
-    [ValidateRange(0, 24)]
+    [ValidateRange(0, 262144)]
+    [int]$ContextLength = 0,
+    [ValidateRange(0, 256)]
     [int]$CPUThreads = 0,
-    [ValidateRange(0, 24)]
+    [ValidateRange(0, 256)]
     [int]$BatchThreads = 0,
     [ValidateRange(128, 4096)]
-    [int]$GPUReserveMiB = 1024,
-    [ValidateSet('f16', 'q8_0')]
-    [string]$KVCacheType = 'f16',
-    [ValidateSet('auto', 'none', 'ngram-mod', 'ngram-simple', 'draft-mtp')]
-    [string]$Speculative = 'none',
+    [int]$GPUReserveMiB,
+    [ValidateSet('q8_0', 'f16')]
+    [string]$KVCacheType,
+    [ValidateSet('auto', 'none', 'draft-mtp', 'ngram-mod', 'ngram-simple')]
+    [string]$Speculative,
+    [string]$DraftModelPath,
     [ValidateSet('none', 'low', 'medium', 'high')]
-    [string]$ReasoningEffort = 'medium',
+    [string]$ReasoningEffort,
     [ValidateRange(0, 8192)]
-    [int]$ThinkingBudget = 512,
+    [int]$ThinkingBudget,
     [ValidateSet('show', 'hide')]
-    [string]$ThinkingDisplay = 'show',
+    [string]$ThinkingDisplay,
     [switch]$EnableWeb,
     [switch]$DisableWeb
 )
+
+# Defaults live in the Python CLI (python -m local_assistant --help); this launcher only
+# finds Python and forwards the options that were given. 0 means "choose automatically".
 
 $ErrorActionPreference = 'Stop'
 if ($EnableWeb -and $DisableWeb) {
     throw 'Choose either -EnableWeb or -DisableWeb, not both.'
 }
+
+function Resolve-FullPath([string]$Path) {
+    # Resolve relative to the PowerShell location, not the .NET process directory.
+    $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $entryPoint = Join-Path $projectRoot 'local_assistant\__main__.py'
-$coderModel = Join-Path $projectRoot 'models\Qwen2.5-Coder-7B\qwen2.5-coder-7b-instruct-q4_k_m.gguf'
-$qwen27bModel = Join-Path $projectRoot 'models\Qwen3.8-27B-HF\Qwen3.8-27B-UD-Q4_K_XL.gguf'
-if ($Model -eq '27b' -or $Model -eq 'qwen27b') {
-    $defaultModel = $qwen27bModel
-    if ($KVCacheType -eq 'f16') { $KVCacheType = 'q8_0' }
-    if ($CPUThreads -eq 0) { $CPUThreads = 6 }
-} elseif ($Model -eq '7b' -or $Model -eq 'coder') {
-    $defaultModel = $coderModel
-} else {
-    $defaultModel = if (Test-Path -LiteralPath $coderModel) { $coderModel } else { $qwen27bModel }
-}
-$modelFile = if ($ModelPath) { [IO.Path]::GetFullPath($ModelPath) } else { $defaultModel }
-$draftModel = Join-Path $projectRoot 'models\Qwen3.8-27B-HF\MTP\mtp-Qwen3.8-27B-Q4_0.gguf'
-$workspace = [IO.Path]::GetFullPath($WorkspacePath)
-
 if (-not (Test-Path -LiteralPath $entryPoint)) {
     throw "Assistant entry point is missing: $entryPoint"
 }
+$workspace = Resolve-FullPath $WorkspacePath
 if (-not (Test-Path -LiteralPath $workspace -PathType Container)) {
     throw "Workspace folder does not exist: $workspace"
-}
-if (-not (Test-Path -LiteralPath $modelFile -PathType Leaf)) {
-    throw "Model file not found: $modelFile"
-}
-if ($Speculative -eq 'auto') {
-    $effectiveSpeculative = if (Test-Path -LiteralPath $draftModel -PathType Leaf) { 'draft-mtp' } else { 'none' }
-} else {
-    $effectiveSpeculative = $Speculative
-}
-if ($effectiveSpeculative -eq 'draft-mtp' -and -not (Test-Path -LiteralPath $draftModel -PathType Leaf)) {
-    throw 'The MTP draft model is missing. Run .\scripts\download-model.ps1 -MTP first.'
 }
 
 $pythonCommand = Get-Command 'python.exe' -All -ErrorAction SilentlyContinue |
@@ -69,14 +54,17 @@ $pythonCommand = Get-Command 'python.exe' -All -ErrorAction SilentlyContinue |
     Select-Object -First 1
 $pythonPath = if ($pythonCommand) { $pythonCommand.Source } else { $null }
 if (-not $pythonPath) {
-    foreach ($candidate in @(
-        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python311\python.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python314\python.exe')
-    )) {
-        if (Test-Path -LiteralPath $candidate) {
-            $pythonPath = $candidate
-            break
-        }
+    $installs = Join-Path $env:LOCALAPPDATA 'Programs\Python'
+    $pythonPath = Get-ChildItem -LiteralPath $installs -Directory -Filter 'Python3*' -ErrorAction SilentlyContinue |
+        Sort-Object { [int]($_.Name -replace '\D', '') } -Descending |
+        ForEach-Object { Join-Path $_.FullName 'python.exe' } |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
+}
+if (-not $pythonPath) {
+    $launcher = Get-Command 'py.exe' -ErrorAction SilentlyContinue
+    if ($launcher) {
+        $pythonPath = & $launcher.Source -3 -c 'import sys; print(sys.executable)' 2>$null
     }
 }
 if (-not $pythonPath) {
@@ -91,37 +79,37 @@ if ([version]::new([int]$Matches[1], [int]$Matches[2]) -lt [version]::new(3, 11)
 }
 
 try {
-    $modelTitle = [System.IO.Path]::GetFileNameWithoutExtension($modelFile).Split("-UD-")[0].Split("-q4")[0]
-    $Host.UI.RawUI.WindowTitle = "Local Assistant | $modelTitle"
+    $Host.UI.RawUI.WindowTitle = 'Local Assistant'
 } catch {
     # A host without a console title can still run the CLI.
 }
 
+$modelArgument = if ($ModelPath) {
+    Resolve-FullPath $ModelPath
+} else {
+    @{ 'auto' = 'auto'; '27b' = '27b'; 'qwen27b' = '27b'; '7b' = '7b'; 'coder' = '7b' }[$Model]
+}
+$webMode = if ($DisableWeb) { 'off' } else { 'auto' }
 $arguments = @(
     '-m', 'local_assistant',
     '--workspace', $workspace,
-    '--model', $modelFile,
-    '--context-length', "$ContextLength",
-    '--gpu-reserve-mib', "$GPUReserveMiB",
-    '--kv-cache-type', $KVCacheType,
-    '--speculative', $effectiveSpeculative,
-    '--reasoning-effort', $ReasoningEffort,
-    '--thinking-budget', "$ThinkingBudget",
-    '--thinking-display', $ThinkingDisplay,
-    '--web-mode', $(if ($DisableWeb) { 'off' } else { 'auto' })
+    '--model', $modelArgument,
+    '--web-mode', $webMode
 )
-if ($effectiveSpeculative -eq 'draft-mtp') {
-    $arguments += @('--draft-model', $draftModel)
-}
-if ($CPUThreads -gt 0) {
-    $arguments += @('--cpu-threads', "$CPUThreads")
-}
-if ($BatchThreads -gt 0) {
-    $arguments += @('--batch-threads', "$BatchThreads")
-}
+if ($ContextLength -gt 0) { $arguments += @('--context-length', "$ContextLength") }
+if ($CPUThreads -gt 0) { $arguments += @('--cpu-threads', "$CPUThreads") }
+if ($BatchThreads -gt 0) { $arguments += @('--batch-threads', "$BatchThreads") }
+if ($PSBoundParameters.ContainsKey('GPUReserveMiB')) { $arguments += @('--gpu-reserve-mib', "$GPUReserveMiB") }
+if ($KVCacheType) { $arguments += @('--kv-cache-type', $KVCacheType) }
+if ($Speculative) { $arguments += @('--speculative', $Speculative) }
+if ($DraftModelPath) { $arguments += @('--draft-model', (Resolve-FullPath $DraftModelPath)) }
+if ($ReasoningEffort) { $arguments += @('--reasoning-effort', $ReasoningEffort) }
+if ($PSBoundParameters.ContainsKey('ThinkingBudget')) { $arguments += @('--thinking-budget', "$ThinkingBudget") }
+if ($ThinkingDisplay) { $arguments += @('--thinking-display', $ThinkingDisplay) }
+
 Write-Host "Python: $pythonPath" -ForegroundColor DarkGray
 Write-Host "Workspace: $workspace" -ForegroundColor DarkGray
-Write-Host "Web research: $(if ($DisableWeb) { 'off' } else { 'auto' })" -ForegroundColor DarkGray
+Write-Host "Web research: $webMode" -ForegroundColor DarkGray
 Push-Location -LiteralPath $projectRoot
 try {
     & $pythonPath @arguments
