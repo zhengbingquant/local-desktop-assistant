@@ -115,16 +115,46 @@ CONTINUE_PROMPT = "Continue exactly where you stopped. Do not repeat any earlier
 TRUNCATION_NOTE = "\n[older output truncated to fit the context window; run the tool again if you need it]"
 
 
-def session_path_for(workspace: Path) -> Path:
-    """Saved conversations live in the user's profile, never inside the workspace or a Git repo."""
+def sessions_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA")
     root = Path(base) / "LocalAssistant" if base else Path.home() / ".local" / "state" / "local-assistant"
+    return root / "sessions"
+
+
+def session_path_for(workspace: Path) -> Path:
+    """Saved conversations live in the user's profile, never inside the workspace or a Git repo."""
     key = hashlib.sha256(str(workspace.resolve()).casefold().encode("utf-8")).hexdigest()[:16]
-    return root / "sessions" / f"{key}.json"
+    return sessions_dir() / f"{key}.json"
 
 
 def _legacy_session_path(workspace: Path) -> Path:
     return workspace / ".local_assistant" / "chat-session.json"
+
+
+def _secure_shred_file(path: Path) -> bool:
+    """Securely overwrite a file with random data and zeros before unlinking to prevent file recovery."""
+    if not path.is_file():
+        return False
+    try:
+        size = path.stat().st_size
+        if size > 0:
+            with path.open("r+b") as handle:
+                handle.seek(0)
+                handle.write(os.urandom(size))
+                handle.flush()
+                os.fsync(handle.fileno())
+                handle.seek(0)
+                handle.write(b"\x00" * size)
+                handle.flush()
+                os.fsync(handle.fileno())
+        path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 class LocalAgent:
@@ -358,6 +388,8 @@ class LocalAgent:
         return session_path_for(self.workspace)
 
     def save_session(self) -> Path | None:
+        if len(self.messages) <= 1:
+            return None
         path = self.session_file()
         payload = {
             "version": 2,
@@ -402,11 +434,34 @@ class LocalAgent:
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self._invalidate_usage()
-        for path in (self.session_file(), _legacy_session_path(self.workspace)):
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        current = self.session_file()
+        for path in (current, current.with_suffix(".tmp"), _legacy_session_path(self.workspace)):
+            _secure_shred_file(path)
+
+    def purge(self, all_workspaces: bool = False) -> int:
+        """Securely shred and permanently delete conversation sessions without leaving traces."""
+        self.reset()
+        shredded_count = 0
+        if all_workspaces:
+            s_dir = sessions_dir()
+            if s_dir.is_dir():
+                for file in list(s_dir.glob("*.json")) + list(s_dir.glob("*.tmp")):
+                    if _secure_shred_file(file):
+                        shredded_count += 1
+                try:
+                    s_dir.rmdir()
+                except OSError:
+                    pass
+            legacy = _legacy_session_path(self.workspace)
+            if _secure_shred_file(legacy):
+                shredded_count += 1
+        else:
+            current = self.session_file()
+            for path in (current, current.with_suffix(".tmp"), _legacy_session_path(self.workspace)):
+                if _secure_shred_file(path):
+                    shredded_count += 1
+        self.model.wipe_logs()
+        return shredded_count
 
     # ── Context accounting and compaction ────────────────────────────
 
@@ -1407,7 +1462,23 @@ def interactive_cli(
                 continue
             if command in {"/new", "/clear"}:
                 agent.reset()
-                print("Started a fresh conversation.\n")
+                print("Started a fresh conversation (previous session data securely erased).\n")
+                continue
+            if command in {"/delete", "/forget", "/purge", "/shred"}:
+                shredded = agent.purge(all_workspaces=False)
+                print(f"✓ Permanently shredded session data ({shredded} file(s) wiped). All local traces removed.\n")
+                continue
+            if command in {"/delete all", "/forget all", "/purge all", "/shred all"}:
+                try:
+                    confirm = input("Permanently shred ALL saved sessions across all workspaces? [y/N]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nCancelled.\n")
+                    continue
+                if confirm in ("y", "yes"):
+                    shredded = agent.purge(all_workspaces=True)
+                    print(f"✓ Permanently shredded {shredded} session file(s) across all workspaces. All local traces removed.\n")
+                else:
+                    print("Cancelled.\n")
                 continue
             if command in {"/save", "/snapshot"}:
                 saved = agent.save_session()

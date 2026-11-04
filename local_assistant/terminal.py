@@ -53,6 +53,7 @@ _COMMAND_GROUPS = (
         ("/save",               "Save the current conversation to disk",           "💾"),
         ("/resume",             "Resume the last saved conversation",              "↩️"),
         ("/new",                "Start a fresh conversation (/clear)",             "⟳"),
+        ("/delete",             "Permanently shred session & wipe local traces",   "🔥"),
         ("/cls",                "Clear the terminal screen",                       "🧹"),
         ("/help",               "Show available commands",                         "?"),
         ("/exit",               "Stop the assistant (/quit)",                      "⏻"),
@@ -77,6 +78,8 @@ _EXTENDED_COMPLETIONS = (
     ("/web off", "Disable web — fully offline session"),
     ("/save", "Save the current conversation to disk for later resume"),
     ("/resume", "Resume the last saved conversation for this workspace"),
+    ("/delete", "Permanently shred this workspace's session and wipe local traces"),
+    ("/delete all", "Permanently shred all saved sessions across all workspaces"),
     ("/workspace ", "Switch active workspace folder, e.g. /workspace C:\\project"),
 )
 

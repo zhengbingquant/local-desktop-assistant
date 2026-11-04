@@ -76,7 +76,8 @@ The assistant reads files, proposes changes as diffs, and runs commands only aft
 | `/context` | Context-window usage (exact token counts from the server) |
 | `/compact` | Summarize older turns now to free context |
 | `/save`, `/resume` | Save or restore the conversation (both also happen automatically) |
-| `/new` | Start fresh and delete the saved conversation |
+| `/new` | Start fresh (previous session is securely erased) |
+| `/delete` | Permanently shred session and wipe all local traces (`/delete all` for all sessions) |
 | `/cls`, `/help`, `/exit` | Clear the screen, list commands, quit |
 
 ### Permission modes
@@ -178,7 +179,7 @@ The model server is only an inference backend; the Python controller owns every 
 - File tools are confined to the workspace, skip common secrets (`.env`, SSH keys, credentials) and binaries, and do not follow symlinks or junctions.
 - Shell commands are not sandboxed. They run as your Windows user, and the full command is shown before it runs.
 - Closing the window stops the model server and any commands it started (Windows Job Object).
-- Conversations are saved locally under `%LOCALAPPDATA%\LocalAssistant\sessions`, never inside your project. `/new` deletes the saved conversation.
+- Conversations are saved locally under `%LOCALAPPDATA%\LocalAssistant\sessions`, never inside your project. `/new` securely erases the saved conversation. `/delete` permanently shreds the session file (overwritten with random data, then zeros, then deleted). `/delete all` shreds every saved session across all workspaces.
 - Files, command output, and web pages are treated as untrusted data and cannot change permissions.
 
 ## Troubleshooting

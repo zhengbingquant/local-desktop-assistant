@@ -456,6 +456,26 @@ class LocalModelServer:
         except OSError:
             return ""
 
+    def wipe_logs(self) -> None:
+        """Securely overwrite and truncate runtime log files so no prompt fragments remain on disk."""
+        if self._log_file and self._log_file.is_file():
+            try:
+                with self._log_file.open("r+b") as handle:
+                    size = handle.seek(0, 2)
+                    if size > 0:
+                        handle.seek(0)
+                        handle.write(os.urandom(size))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                        handle.seek(0)
+                        handle.write(b"\x00" * size)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                        handle.seek(0)
+                        handle.truncate(0)
+            except OSError:
+                pass
+
     def close(self) -> None:
         process = self.process
         self.process = None
@@ -481,6 +501,17 @@ class LocalModelServer:
             self._job = None
             if job is not None:
                 job.close()
+            if self._log_file and self._log_file.is_file():
+                try:
+                    size = self._log_file.stat().st_size
+                    if size > 0:
+                        with self._log_file.open("r+b") as handle:
+                            handle.write(b"\x00" * size)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                    self._log_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
             temp_dir = self._temp_dir
             self._temp_dir = None
             if temp_dir is not None:

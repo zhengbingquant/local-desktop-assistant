@@ -49,7 +49,7 @@ Answer text, reasoning, and ordinary code blocks stream as they arrive. Only a f
 
 ## Sessions
 
-Conversations are saved after every turn to `%LOCALAPPDATA%\LocalAssistant\sessions\<hash of the workspace path>.json` and resumed automatically when you start in the same folder. `/new` deletes the saved conversation. Earlier versions wrote `.local_assistant\chat-session.json` inside the workspace, where a transcript could be committed by accident; that file is moved to the new location the first time it is loaded.
+Conversations are saved after every turn to `%LOCALAPPDATA%\LocalAssistant\sessions\<hash of the workspace path>.json` and resumed automatically when you start in the same folder. `/new` securely erases the saved conversation (overwrite with random data, then zeros, then delete). `/delete` permanently shreds the session file and wipes any runtime logs that could contain prompt fragments; `/delete all` shreds every saved session across all workspaces (with a confirmation prompt). Earlier versions wrote `.local_assistant\chat-session.json` inside the workspace, where a transcript could be committed by accident; that file is moved to the new location the first time it is loaded.
 
 ## Local performance
 
