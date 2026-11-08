@@ -74,9 +74,10 @@ The assistant reads files, proposes changes as diffs, and runs commands only aft
 | `/web` | Web lookups: `auto` or `off` |
 | `/workspace [path]` | Show or switch the working folder |
 | `/context` | Context-window usage (exact token counts from the server) |
+| `/history` | Show conversation history (`/history all` for full transcript) |
 | `/compact` | Summarize older turns now to free context |
-| `/save`, `/resume` | Save or restore the conversation (both also happen automatically) |
-| `/new` | Start fresh (previous session is securely erased) |
+| `/save`, `/resume` | Save or restore the conversation (shows history; `/resume list` to view all sessions) |
+| `/new` | Start fresh conversation (previous session is archived and can be resumed) |
 | `/delete` | Permanently shred session and wipe all local traces (`/delete all` for all sessions) |
 | `/cls`, `/help`, `/exit` | Clear the screen, list commands, quit |
 

@@ -38,7 +38,7 @@ if ($Model -eq '27b') {
         '--batch-size', '512',
         '--ubatch-size', '512',
         '--reasoning', 'on',
-        '--reasoning-effort', 'xhigh',
+        '--reasoning-effort', 'high',
         '--temp', '1.0',
         '--top-p', '0.95',
         '--top-k', '20'

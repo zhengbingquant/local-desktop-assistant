@@ -49,7 +49,7 @@ Answer text, reasoning, and ordinary code blocks stream as they arrive. Only a f
 
 ## Sessions
 
-Conversations are saved after every turn to `%LOCALAPPDATA%\LocalAssistant\sessions\<hash of the workspace path>.json` and resumed automatically when you start in the same folder. `/new` securely erases the saved conversation (overwrite with random data, then zeros, then delete). `/delete` permanently shreds the session file and wipes any runtime logs that could contain prompt fragments; `/delete all` shreds every saved session across all workspaces (with a confirmation prompt). Earlier versions wrote `.local_assistant\chat-session.json` inside the workspace, where a transcript could be committed by accident; that file is moved to the new location the first time it is loaded.
+Conversations are saved after every turn to `%LOCALAPPDATA%\LocalAssistant\sessions\<hash of the workspace path>.json` and resumed automatically when you start in the same folder. `/new` archives the current conversation so it can be resumed later with `/resume list`, then starts a fresh session. `/delete` permanently shreds the session file (overwritten with random data, then zeros, then deleted) and wipes any runtime logs that could contain prompt fragments; `/delete all` shreds every saved session across all workspaces (with a confirmation prompt). Earlier versions wrote `.local_assistant\chat-session.json` inside the workspace, where a transcript could be committed by accident; that file is moved to the new location the first time it is loaded.
 
 ## Local performance
 
@@ -59,6 +59,6 @@ Benchmarks and the reasoning behind each runtime setting are in [model-setup.md]
 
 - [llama.cpp server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 - [llama.cpp speculative decoding](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)
-- [Qwen3.8 official repository](https://github.com/QwenLM/Qwen3.8)
+- [Qwen3 official repository](https://github.com/QwenLM/Qwen3)
 - [Qwen 2.5 Coder](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF)
 - [Unsloth Qwen3.8 GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)

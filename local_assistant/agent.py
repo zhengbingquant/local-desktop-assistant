@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -129,6 +130,36 @@ def session_path_for(workspace: Path) -> Path:
 
 def _legacy_session_path(workspace: Path) -> Path:
     return workspace / ".local_assistant" / "chat-session.json"
+
+
+def list_all_sessions() -> list[dict[str, Any]]:
+    """Return all saved sessions across workspaces, sorted by most recently saved."""
+    s_dir = sessions_dir()
+    if not s_dir.is_dir():
+        return []
+    sessions: list[dict[str, Any]] = []
+    for file in s_dir.glob("*.json"):
+        if file.name.endswith(".tmp"):
+            continue
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                ws = data.get("workspace") or ""
+                msgs = data.get("messages") or []
+                saved_at = data.get("saved_at") or ""
+                model_name = data.get("model") or ""
+                if ws and isinstance(msgs, list):
+                    sessions.append({
+                        "path": file,
+                        "workspace": ws,
+                        "messages_count": len(msgs),
+                        "saved_at": saved_at,
+                        "model": model_name,
+                    })
+        except Exception:
+            continue
+    sessions.sort(key=lambda s: str(s.get("saved_at", "")), reverse=True)
+    return sessions
 
 
 def _secure_shred_file(path: Path) -> bool:
@@ -308,15 +339,30 @@ class LocalAgent:
         else:
             print("Invalid thinking display mode. Use /think show or /think hide.")
 
+    def reset_in_memory(self) -> None:
+        """Clear active messages in memory without deleting the session file on disk."""
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+        self._invalidate_usage()
+
     def switch_workspace(self, new_workspace: Path) -> None:
         resolved = new_workspace.expanduser().resolve()
         if not resolved.is_dir():
             print(f"Workspace path is not a directory: {resolved}")
             return
+        if resolved == self.workspace:
+            return
+        self.save_session()
         self.tools.set_root(resolved)
         self.workspace = self.tools.root
         self._refresh_system_prompt()
         print(f"Active workspace switched to: {self.workspace}")
+        restored = self.load_session()
+        if restored:
+            print(f"Resumed the saved conversation for this workspace ({restored} messages).\n")
+            self.print_history(limit=8)
+        else:
+            self.reset_in_memory()
+            print()
 
     def show_model_details(self) -> None:
         info, tuning = self.model.info, self.model.tuning
@@ -407,11 +453,43 @@ class LocalAgent:
         except OSError:
             return None
 
-    def load_session(self) -> int:
-        """Restore this workspace's saved conversation; returns the number of messages restored."""
-        current, legacy = self.session_file(), _legacy_session_path(self.workspace)
-        path = current if current.is_file() else legacy
-        if not path.is_file():
+    def archive_session(self) -> Path | None:
+        """Save a snapshot of the current conversation to an archive before starting a new one."""
+        if len(self.messages) <= 1:
+            return None
+        self.save_session()
+        key = hashlib.sha256(str(self.workspace.resolve()).casefold().encode("utf-8")).hexdigest()[:16]
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        archive_path = sessions_dir() / f"{key}_{timestamp}.json"
+        payload = {
+            "version": 2,
+            "workspace": str(self.workspace),
+            "model": self.model.info.name,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+            "messages": self.messages[1:],
+        }
+        try:
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            archive_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            return archive_path
+        except OSError:
+            return None
+
+    def load_session(self, path: Path | None = None) -> int:
+        """Restore a saved conversation; returns the number of messages restored."""
+        legacy = _legacy_session_path(self.workspace)
+        if path is None:
+            current = self.session_file()
+            if current.is_file():
+                path = current
+            elif legacy.is_file():
+                path = legacy
+            else:
+                key = hashlib.sha256(str(self.workspace.resolve()).casefold().encode("utf-8")).hexdigest()[:16]
+                archives = sorted(sessions_dir().glob(f"{key}_*.json"), reverse=True)
+                if archives:
+                    path = archives[0]
+        if not path or not path.is_file():
             return 0
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -430,6 +508,68 @@ class LocalAgent:
             except OSError:
                 pass
         return len(messages)
+
+    def print_history(self, limit: int | None = None) -> None:
+        """Display conversation history cleanly in the terminal."""
+        msgs = [m for m in self.messages if m.get("role") != "system"]
+        if not msgs:
+            print("No conversation history to display.\n")
+            return
+
+        color = is_color_enabled()
+        cyan = "\x1b[96m" if color else ""
+        white = "\x1b[1;97m" if color else ""
+        muted = "\x1b[90m" if color else ""
+        reset = "\x1b[0m" if color else ""
+
+        total = len(msgs)
+        if limit is not None and total > limit:
+            to_show = msgs[-limit:]
+            print(f"{muted}[Showing last {limit} of {total} messages in history · use /history all to view full conversation]{reset}\n")
+        else:
+            to_show = msgs
+
+        width = max(30, min(shutil.get_terminal_size((80, 24)).columns - 4, 76))
+        sep = "─" * width
+        print(f"{muted}{sep}{reset}")
+
+        for msg in to_show:
+            role = msg.get("role")
+            content = str(msg.get("content") or "")
+            if role == "user":
+                if content.startswith(SUMMARY_MARKER):
+                    summary_text = content[len(SUMMARY_MARKER):].strip()
+                    print(f"{muted}[Summary of earlier turns]{reset}")
+                    print(f"{muted}{summary_text}{reset}\n")
+                else:
+                    print(f"{cyan}You ›{reset} {white}{content}{reset}\n")
+            elif role == "assistant":
+                for call in msg.get("tool_calls") or []:
+                    fn = call.get("function") or {}
+                    name = fn.get("name") or "tool"
+                    raw_args = fn.get("arguments", "{}")
+                    try:
+                        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                        if isinstance(args, dict):
+                            args_str = " ".join(f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}" for k, v in args.items())
+                            if len(args_str) > 70:
+                                args_str = args_str[:67] + "..."
+                        else:
+                            args_str = str(args)[:70]
+                    except Exception:
+                        args_str = str(raw_args)[:70]
+                    print(f"{muted}[tool: {name}{(' ' + args_str) if args_str else ''}]{reset}")
+                if content and content.strip() and content != SUMMARY_ACK:
+                    print(f"{content.strip()}\n")
+            elif role == "tool":
+                tool_output = content.strip()
+                if any(err_word in tool_output.lower() for err_word in ("error", "exception", "failed", "rejected")):
+                    first_line = tool_output.splitlines()[0] if tool_output else ""
+                    if len(first_line) > 76:
+                        first_line = first_line[:73] + "..."
+                    print(f"{muted}  ↳ {first_line}{reset}\n")
+
+        print(f"{muted}{sep}{reset}\n")
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt}]
@@ -459,6 +599,10 @@ class LocalAgent:
             current = self.session_file()
             for path in (current, current.with_suffix(".tmp"), _legacy_session_path(self.workspace)):
                 if _secure_shred_file(path):
+                    shredded_count += 1
+            key = hashlib.sha256(str(self.workspace.resolve()).casefold().encode("utf-8")).hexdigest()[:16]
+            for archive in sessions_dir().glob(f"{key}_*.json"):
+                if _secure_shred_file(archive):
                     shredded_count += 1
         self.model.wipe_logs()
         return shredded_count
@@ -862,7 +1006,49 @@ def _clean_history(raw: Any) -> list[dict[str, Any]]:
             cleaned.append(message)
         elif role == "tool":
             cleaned.append({"role": "tool", "tool_call_id": str(item.get("tool_call_id") or ""), "content": content})
-    return cleaned
+
+    # Ensure tool calls and responses match properly to keep OpenAI/llama.cpp format valid
+    valid_cleaned: list[dict[str, Any]] = []
+    i = 0
+    while i < len(cleaned):
+        msg = cleaned[i]
+        role = msg.get("role")
+        if role == "tool":
+            # Orphan tool result without preceding assistant call; drop
+            i += 1
+            continue
+        valid_cleaned.append(msg)
+        if role == "assistant" and msg.get("tool_calls"):
+            expected_ids = [c["id"] for c in msg["tool_calls"] if isinstance(c, dict) and c.get("id")]
+            j = i + 1
+            found_ids = set()
+            while j < len(cleaned) and cleaned[j].get("role") == "tool":
+                tool_msg = cleaned[j]
+                call_id = tool_msg.get("tool_call_id")
+                if call_id in expected_ids:
+                    valid_cleaned.append(tool_msg)
+                    found_ids.add(call_id)
+                j += 1
+            for missing_id in expected_ids:
+                if missing_id not in found_ids:
+                    valid_cleaned.append({
+                        "role": "tool",
+                        "tool_call_id": missing_id,
+                        "content": "Turn interrupted before this tool finished executing.",
+                    })
+            i = j
+            continue
+        i += 1
+
+    # Strip trailing empty assistant messages if any
+    while valid_cleaned and valid_cleaned[-1].get("role") == "assistant":
+        last = valid_cleaned[-1]
+        if not last.get("content") and not last.get("tool_calls"):
+            valid_cleaned.pop()
+        else:
+            break
+
+    return valid_cleaned
 
 
 # ── Tool-call parsing ────────────────────────────────────────────────
@@ -1440,6 +1626,7 @@ def interactive_cli(
     restored = agent.load_session()
     if restored:
         print(f"Resumed the saved conversation for this workspace ({restored} messages). Type /new to start fresh.\n")
+        agent.print_history(limit=8)
     print("Ready. Type / to browse commands · Ctrl+C interrupts the current turn.\n")
 
     try:
@@ -1447,6 +1634,7 @@ def interactive_cli(
             try:
                 user_text = read_prompt_line().strip()
             except (EOFError, KeyboardInterrupt):
+                agent.save_session()
                 print("\nStopping the assistant...")
                 return
             if not user_text:
@@ -1460,9 +1648,20 @@ def interactive_cli(
             if command in {"/", "/help"}:
                 print_command_menu()
                 continue
+            if command in {"/history", "/transcript"}:
+                agent.print_history(limit=10)
+                continue
+            if command in {"/history all", "/history full", "/transcript all"}:
+                agent.print_history(limit=None)
+                continue
             if command in {"/new", "/clear"}:
-                agent.reset()
-                print("Started a fresh conversation (previous session data securely erased).\n")
+                if len(agent.messages) > 1:
+                    agent.archive_session()
+                    agent.reset_in_memory()
+                    print("Started a fresh conversation. (Previous conversation saved — type /resume to restore it).\n")
+                else:
+                    agent.reset_in_memory()
+                    print("Started a fresh conversation.\n")
                 continue
             if command in {"/delete", "/forget", "/purge", "/shred"}:
                 shredded = agent.purge(all_workspaces=False)
@@ -1490,9 +1689,63 @@ def interactive_cli(
             if command in {"/resume", "/restore"}:
                 restored = agent.load_session()
                 if restored:
-                    print(f"Resumed the last saved conversation ({restored} messages).\n")
+                    print(f"Resumed the last saved conversation ({restored} messages):\n")
+                    agent.print_history()
                 else:
-                    print("No saved conversation was found for this workspace.\n")
+                    all_sessions = list_all_sessions()
+                    other_sessions = [s for s in all_sessions if Path(s["workspace"]).resolve() != agent.workspace.resolve()]
+                    if other_sessions:
+                        print("No saved conversation was found for this workspace.")
+                        print("\nAvailable saved conversations from other workspaces:")
+                        for idx, s in enumerate(other_sessions[:5], 1):
+                            time_str = f" · {s['saved_at']}" if s['saved_at'] else ""
+                            print(f"  {idx}. {s['workspace']} ({s['messages_count']} messages{time_str})")
+                        print("\nTo resume one, type: /resume 1 or /resume <path>\n")
+                    else:
+                        print("No saved conversation was found.\n")
+                continue
+            if command.startswith(("/resume ", "/restore ")):
+                arg = user_text.split(None, 1)[1].strip()
+                if arg.lower() in {"list", "all", "ls"}:
+                    all_sessions = list_all_sessions()
+                    if not all_sessions:
+                        print("No saved conversation sessions found.\n")
+                    else:
+                        print("\nSaved Conversation Sessions:")
+                        for idx, s in enumerate(all_sessions, 1):
+                            is_curr = " [current workspace]" if Path(s["workspace"]).resolve() == agent.workspace.resolve() else ""
+                            time_str = f" · {s['saved_at']}" if s['saved_at'] else ""
+                            print(f"  {idx}. {s['workspace']} ({s['messages_count']} msgs{time_str}){is_curr}")
+                        print("\nType /resume <number> to restore a session.\n")
+                    continue
+                all_sessions = list_all_sessions()
+                target_session = None
+                if arg.isdigit():
+                    num = int(arg)
+                    if 1 <= num <= len(all_sessions):
+                        target_session = all_sessions[num - 1]
+                    else:
+                        print(f"Invalid session number: {arg}. Type /resume list to see options.\n")
+                        continue
+                else:
+                    norm_arg = Path(arg.strip('\'"')).expanduser().resolve()
+                    for s in all_sessions:
+                        if Path(s["workspace"]).resolve() == norm_arg:
+                            target_session = s
+                            break
+                if target_session:
+                    sess_path = target_session["path"]
+                    restored = agent.load_session(sess_path)
+                    if restored:
+                        target_ws = Path(target_session["workspace"]).resolve()
+                        print(f"Resumed conversation from {target_ws} ({restored} messages):\n")
+                        if target_ws != agent.workspace.resolve() and target_ws.is_dir():
+                            agent.switch_workspace(target_ws)
+                        agent.print_history()
+                    else:
+                        print(f"Could not load session from {sess_path}.\n")
+                else:
+                    print(f"Session not found: {arg}. Type /resume list to see available sessions.\n")
                 continue
             if command == "/workspace":
                 print(f"Active workspace: {agent.workspace}")
@@ -1697,6 +1950,10 @@ def interactive_cli(
                 agent.save_session()
                 print("\nTurn interrupted. The local server will stop if you exit.")
     finally:
+        try:
+            agent.save_session()
+        except Exception:
+            pass
         agent.model.close()
 
 
