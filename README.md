@@ -180,7 +180,7 @@ The model server is only an inference backend; the Python controller owns every 
 - File tools are confined to the workspace, skip common secrets (`.env`, SSH keys, credentials) and binaries, and do not follow symlinks or junctions.
 - Shell commands are not sandboxed. They run as your Windows user, and the full command is shown before it runs.
 - Closing the window stops the model server and any commands it started (Windows Job Object).
-- Conversations are saved locally under `%LOCALAPPDATA%\LocalAssistant\sessions`, never inside your project. `/new` securely erases the saved conversation. `/delete` permanently shreds the session file (overwritten with random data, then zeros, then deleted). `/delete all` shreds every saved session across all workspaces.
+- Conversations are saved locally under `%LOCALAPPDATA%\LocalAssistant\sessions`, never inside your project. `/new` archives the current conversation so it can be resumed later, then starts a fresh session. `/delete` permanently shreds the session file (overwritten with random data, then zeros, then deleted). `/delete all` shreds every saved session across all workspaces.
 - Files, command output, and web pages are treated as untrusted data and cannot change permissions.
 
 ## Troubleshooting

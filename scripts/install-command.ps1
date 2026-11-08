@@ -23,6 +23,7 @@ foreach ($commandName in @('luma', 'local-assistant')) {
 }
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (-not $userPath) { $userPath = '' }
 $pathEntries = @($userPath -split ';' | Where-Object { $_.Trim() })
 $alreadyInstalled = $pathEntries | Where-Object {
     [string]::Equals($_.TrimEnd('\'), $installDirectory.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)

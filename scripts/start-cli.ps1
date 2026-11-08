@@ -8,8 +8,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $cli = Join-Path $repo 'runtime\llama.cpp\llama-completion.exe'
+$hfModel = Join-Path $repo 'models\Qwen3.8-27B-HF\Qwen3.8-27B-UD-Q4_K_XL.gguf'
+$baseModel = Join-Path $repo 'models\Qwen3.8-27B\Qwen3.8-27B-UD-Q4_K_XL.gguf'
 $models = @{
-    '27b' = Join-Path $repo 'models\Qwen3.8-27B-HF\Qwen3.8-27B-UD-Q4_K_XL.gguf'
+    '27b' = if (Test-Path -LiteralPath $hfModel) { $hfModel } else { $baseModel }
     '7b' = Join-Path $repo 'models\Qwen2.5-Coder-7B\qwen2.5-coder-7b-instruct-q4_k_m.gguf'
 }
 if ($Model -eq 'auto') {

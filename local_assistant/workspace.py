@@ -523,11 +523,21 @@ class WorkspaceTools:
             p_str = str(p)
             if " " in p_str and p_str not in paths_to_quote:
                 paths_to_quote.append(p_str)
-        for base_path in paths_to_quote:
+        normalized_targets = []
+        for p in paths_to_quote:
+            normalized_targets.append(p)
+            slash_variant = p.replace("\\", "/")
+            if slash_variant != p and slash_variant not in normalized_targets:
+                normalized_targets.append(slash_variant)
+        normalized_targets.sort(key=len, reverse=True)
+
+        for base_path in normalized_targets:
             parts = []
             pos = 0
             in_quote = None
             for i, ch in enumerate(command):
+                if i < pos:
+                    continue
                 if ch in ("'", '"'):
                     if in_quote == ch:
                         in_quote = None

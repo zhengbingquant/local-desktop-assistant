@@ -218,6 +218,8 @@ def select_menu(
     current: str | None = None,
 ) -> str | None:
     """Show an interactive in-place radio selection menu using arrow keys."""
+    if not options:
+        return None
     if os.name != "nt" or not _VT_READY or not sys.stdin.isatty() or not sys.stdout.isatty():
         print(f"\n{title}")
         print("─" * 40)

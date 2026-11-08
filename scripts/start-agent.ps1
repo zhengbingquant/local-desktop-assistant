@@ -1,7 +1,6 @@
 param(
     [string]$WorkspacePath = (Get-Location).Path,
     [string]$ModelPath,
-    [ValidateSet('auto', '27b', '7b', 'qwen27b', 'coder')]
     [string]$Model = 'auto',
     [ValidateRange(0, 262144)]
     [int]$ContextLength = 0,
@@ -87,7 +86,7 @@ try {
 $modelArgument = if ($ModelPath) {
     Resolve-FullPath $ModelPath
 } else {
-    @{ 'auto' = 'auto'; '27b' = '27b'; 'qwen27b' = '27b'; '7b' = '7b'; 'coder' = '7b' }[$Model]
+    $Model
 }
 $webMode = if ($DisableWeb) { 'off' } else { 'auto' }
 $arguments = @(

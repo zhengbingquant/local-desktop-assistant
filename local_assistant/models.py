@@ -117,8 +117,13 @@ def resolve_model(target: str | Path, project_root: Path) -> Path | None:
     if lowered in {"", "auto"}:
         return default_model(project_root)
     if lowered in MODEL_ALIASES:
-        candidate = known_model_path(project_root, MODEL_ALIASES[lowered])
-        return candidate.resolve() if candidate.is_file() else None
+        target_alias = MODEL_ALIASES[lowered]
+        candidate = known_model_path(project_root, target_alias)
+        if candidate.is_file():
+            return candidate.resolve()
+        for gguf in discover_models(project_root):
+            if model_alias(gguf, project_root) == target_alias:
+                return gguf
     candidate = Path(text).expanduser()
     if candidate.is_file():
         return candidate.resolve()
@@ -135,6 +140,11 @@ def model_alias(path: Path, project_root: Path) -> str | None:
                 return alias
         except OSError:
             continue
+    name_lower = path.name.lower()
+    if "27b" in name_lower and ("qwen3" in name_lower or "qwen" in name_lower):
+        return "27b"
+    if "7b" in name_lower and ("coder" in name_lower or "qwen2.5" in name_lower):
+        return "7b"
     return None
 
 
