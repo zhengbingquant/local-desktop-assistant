@@ -18,7 +18,7 @@ Local `llama.cpp` inference · approval-gated file and shell tools · no cloud m
 
 ## Why Local Assistant
 
-- **Private by default.** Prompts, files, and transcripts stay on your machine. Optional web lookups go to DuckDuckGo, are printed before they run, and can be switched off.
+- **Private by default.** Prompts, files, and transcripts stay on your machine. Web research starts off. Enable it with `/web auto` to send search queries to DuckDuckGo and fetch public pages. Each lookup appears in the terminal.
 - **Does the work, with your approval.** It reads, searches, and edits files and runs PowerShell, showing a diff or the exact command first.
 - **Tuned for laptop hardware.** llama.cpp settings are chosen per model from its GGUF metadata. On an RTX 4050 laptop that made Qwen3.8-27B generate 44% faster and read prompts twice as fast.
 - **Replaceable models.** Drop any GGUF into `models\`; reasoning support, speculative-decoding heads, and context limits are detected automatically.
@@ -61,7 +61,13 @@ You › Add a --verbose flag to cli.py and document it in the README.
 You › Run the tests and fix whatever fails.
 ```
 
-The assistant reads files, proposes changes as diffs, and runs commands only after you approve them. Conversations are saved after every turn and resume automatically the next time you start in the same folder. Pasting multi-line text keeps it as one message.
+In the default approval mode, the assistant shows a diff before changing a file and shows the PowerShell command before running it. You can paste multiple lines as one message.
+
+### Resume a previous chat
+
+Start `luma` in the same folder to reopen its active conversation. The agent saves your request before generation and saves completed tool rounds and replies as it goes. For an older chat, type `/resume`. The list shows the workspace, save time, message count, and a preview. Type `/resume 2` to continue the second entry, including when it belongs to another workspace. If the folder has moved, open its new location and use `/resume 2 --here` to continue a copy there. The original chat stays in the list.
+
+`/new` starts an empty chat and keeps previous conversations in the list. If you exit immediately, the workspace still opens fresh next time. Existing JSON conversations and timestamped archives import automatically on upgrade. A workspace-local legacy chat imports when you open that folder.
 
 ### Commands
 
@@ -71,14 +77,14 @@ The assistant reads files, proposes changes as diffs, and runs commands only aft
 | `/effort` | Reasoning depth: `none`, `low`, `medium`, `high`, or `budget N` |
 | `/think` | Show or hide the model's thinking |
 | `/permission` | Approval mode: `ask`, `workspace`, or `full` |
-| `/web` | Web lookups: `auto` or `off` |
+| `/web` | Toggle public web lookups with `auto` or `off` (default) |
 | `/workspace [path]` | Show or switch the working folder |
 | `/context` | Context-window usage (exact token counts from the server) |
-| `/history` | Show conversation history (`/history all` for full transcript) |
+| `/history` | Show recent messages. `/history all` shows the full saved history, including summaries of compacted turns |
 | `/compact` | Summarize older turns now to free context |
-| `/save`, `/resume` | Save or restore the conversation (shows history; `/resume list` to view all sessions) |
-| `/new` | Start fresh conversation (previous session is archived and can be resumed) |
-| `/delete` | Permanently shred session and wipe all local traces (`/delete all` for all sessions) |
+| `/save`, `/resume` | Save now or list saved chats. Use `/resume <number>` to select one, or `/resume "<workspace path>"` to reopen that folder’s selected chat |
+| `/new` | Start fresh and keep the previous chat available in `/resume` |
+| `/delete`, `/delete all` | Confirm deletion of every saved chat in the current workspace, or across all workspaces |
 | `/cls`, `/help`, `/exit` | Clear the screen, list commands, quit |
 
 ### Permission modes
@@ -104,9 +110,11 @@ The 27B writes about three tokens per second, so long answers take minutes. For 
 
 ## Performance
 
-Measured with the agent's real prompts on a Ryzen 5 7640HS, RTX 4050 Laptop (6 GB), and 32 GB DDR5-5600:
+The fixed system instructions now occupy 1,126 characters, down from 5,068, before workspace guidance and tool definitions. Workspace scans reuse file metadata from directory enumeration, and `/resume` reads chat summaries without parsing transcripts. These changes have not been benchmarked end to end.
 
-| Qwen3.8-27B | Before | Now |
+The following figures come from the earlier llama.cpp tuning run on a Ryzen 5 7640HS, RTX 4050 Laptop (6 GB), and 32 GB DDR5-5600.
+
+| Qwen3.8-27B | Before tuning | After tuning |
 | :-- | --: | --: |
 | Generation speed | 2.04 tok/s | 2.94 tok/s |
 | First request (2,281-token prompt) | 35 s | 16 s |
@@ -135,7 +143,7 @@ Every option is optional; defaults are chosen per model.
 | `-ReasoningEffort none\|low\|medium\|high` | `medium` | `none` turns thinking off |
 | `-ThinkingBudget N` | 512 | Thinking tokens per reply; 0 means no limit |
 | `-ThinkingDisplay show\|hide` | `show` | |
-| `-DisableWeb` | | Fully offline session |
+| `-EnableWeb`, `-DisableWeb` | Web tools off | Opt into public web research for this run, or explicitly disable it |
 | `-CPUThreads N` | ⅔ of logical cores (27B) | |
 | `-GPUReserveMiB N` | 512 | Raise to 1024 if other apps need VRAM |
 | `-KVCacheType q8_0\|f16` | `q8_0` | |
@@ -176,11 +184,11 @@ The model server is only an inference backend; the Python controller owns every 
 ## Privacy and security
 
 - The inference server listens only on `127.0.0.1`, on a temporary port with a per-session API key, in offline mode with its web UI and built-in tools disabled.
-- Nothing goes to a cloud model. Web lookups go to DuckDuckGo only while web research is on, and each search or page fetch is printed. Use `/web off` or `-DisableWeb` to stay fully offline.
+- Inference stays on your machine. With web research enabled, DuckDuckGo receives the query and a fetched site receives the page request. `/web off` disables both web tools. Approved PowerShell commands retain your Windows account’s network access.
 - File tools are confined to the workspace, skip common secrets (`.env`, SSH keys, credentials) and binaries, and do not follow symlinks or junctions.
 - Shell commands are not sandboxed. They run as your Windows user, and the full command is shown before it runs.
 - Closing the window stops the model server and any commands it started (Windows Job Object).
-- Conversations are saved locally under `%LOCALAPPDATA%\LocalAssistant\sessions`, never inside your project. `/new` archives the current conversation so it can be resumed later, then starts a fresh session. `/delete` permanently shreds the session file (overwritten with random data, then zeros, then deleted). `/delete all` shreds every saved session across all workspaces.
+- Conversations are stored in `%LOCALAPPDATA%\LocalAssistant\sessions\history.sqlite3`. The database contains readable chat history, so treat a backup like a transcript. The deletion commands clear saved conversations in scope. Backups and filesystem snapshots can retain copies.
 - Files, command output, and web pages are treated as untrusted data and cannot change permissions.
 
 ## Troubleshooting
@@ -194,6 +202,7 @@ The model server is only an inference backend; the Python controller owns every 
 | No NVIDIA GPU | `.\scripts\install-runtime.ps1 -Backend vulkan -Force` (or `cpu`) |
 | `aria2c is required` | `winget install --id aria2.aria2 --exact` |
 | `Python 3.11 or newer was not found` | Install Python from [python.org](https://www.python.org/downloads/) |
+| An older chat is missing | Type `/resume` to see all workspaces. For a legacy `.local_assistant\chat-session.json`, open its original folder. If import reports an error, the JSON remains available for recovery. |
 | Scripts are blocked | `powershell -ExecutionPolicy Bypass -File .\scripts\<script>.ps1` |
 
 ## Project structure
@@ -205,6 +214,7 @@ local-desktop-assistant/
 │   ├── agent.py                # Agent loop, context management, interactive CLI
 │   ├── models.py               # Model discovery, GGUF metadata, runtime tuning
 │   ├── runtime.py              # llama-server lifecycle and streaming
+│   ├── sessions.py             # Local chat storage and legacy JSON import
 │   ├── terminal.py             # Welcome screen, menus, input line
 │   ├── web.py                  # Web search and page extraction
 │   └── workspace.py            # File tools and permission gates

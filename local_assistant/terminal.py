@@ -52,9 +52,9 @@ _COMMAND_GROUPS = (
         ("/history",            "Show conversation history (/history all for full)", "📜"),
         ("/compact",            "Compact conversation history to save tokens",     "🗜️"),
         ("/save",               "Save the current conversation to disk",           "💾"),
-        ("/resume",             "Resume the last saved conversation",              "↩️"),
+        ("/resume",             "Choose a saved chat to continue",                 "↩️"),
         ("/new",                "Start a fresh conversation (/clear)",             "⟳"),
-        ("/delete",             "Permanently shred session & wipe local traces",   "🔥"),
+        ("/delete",             "Delete this workspace's saved chats",             "🔥"),
         ("/cls",                "Clear the terminal screen",                       "🧹"),
         ("/help",               "Show available commands",                         "?"),
         ("/exit",               "Stop the assistant (/quit)",                      "⏻"),
@@ -80,11 +80,11 @@ _EXTENDED_COMPLETIONS = (
     ("/history", "Show conversation history for this session"),
     ("/history all", "Show full conversation history without truncation"),
     ("/save", "Save the current conversation to disk for later resume"),
-    ("/resume", "Resume the last saved conversation for this workspace"),
+    ("/resume", "Choose a saved chat to continue"),
     ("/resume list", "List all saved conversation sessions across workspaces"),
-    ("/new", "Start a fresh conversation (archives previous session)"),
-    ("/delete", "Permanently shred this workspace's session and wipe local traces"),
-    ("/delete all", "Permanently shred all saved sessions across all workspaces"),
+    ("/new", "Start a fresh conversation and keep the previous chat"),
+    ("/delete", "Delete saved chats for this workspace after confirmation"),
+    ("/delete all", "Delete saved chats across all workspaces after confirmation"),
     ("/workspace ", "Switch active workspace folder, e.g. /workspace C:\\project"),
 )
 
@@ -258,6 +258,9 @@ def select_menu(
         sys.stdout.write(f"  \x1b[90m{separator}\x1b[0m\r\n")
         for idx, (opt_id, label, desc) in enumerate(options):
             is_active = (opt_id == current)
+            label = label[:max(12, width // 2)]
+            remaining = width - max(12, len(label)) - 9 - (8 if is_active else 0)
+            desc = desc[:max(0, remaining)]
             radio = "●" if is_active else "○"
             active_badge = " \x1b[92m(active)\x1b[0m" if is_active else ""
             if idx == selected:
@@ -404,7 +407,9 @@ def read_prompt_line(prompt: str = "You › ") -> str:
             redraw()
             sys.stdout.write("\r\n")
             sys.stdout.flush()
-            return buffer
+            # getwch() delivers UTF-16 code units on Windows. Join surrogate pairs
+            # before the message goes into a UTF-8 request or session preview.
+            return buffer.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
         if key == "\x03":
             sys.stdout.write("\r\n")
             sys.stdout.flush()

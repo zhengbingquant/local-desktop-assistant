@@ -37,4 +37,4 @@ Write-Host "Installed terminal commands: luma, local-assistant" -ForegroundColor
 Write-Host "Launcher: $launcher" -ForegroundColor DarkGray
 Write-Host 'Workspace defaults to the folder where you run the command.' -ForegroundColor DarkGray
 Write-Host 'Close and reopen your terminal, then enter: luma' -ForegroundColor Cyan
-Write-Host 'Use: luma -DisableWeb   to force an offline session.' -ForegroundColor DarkGray
+Write-Host 'Use: luma -EnableWeb   to enable public web research for this session.' -ForegroundColor DarkGray

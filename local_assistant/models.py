@@ -82,55 +82,53 @@ def known_model_path(project_root: Path, alias: str) -> Path:
     return project_root / "models" / folder / filename
 
 
+def _available_gguf(path: Path, *, discover: bool = True) -> bool:
+    name = path.name.lower()
+    if path.suffix.lower() != ".gguf" or (discover and ("mmproj" in name or "mtp" in name)):
+        return False
+    try:
+        # aria2 can have written the last range while earlier ranges are still missing.
+        return (
+            path.is_file()
+            and (not discover or path.stat().st_size >= MIN_MODEL_BYTES)
+            and not path.with_suffix(path.suffix + ".aria2").exists()
+        )
+    except OSError:
+        return False
+
+
 def discover_models(project_root: Path) -> list[Path]:
-    """Return runnable GGUF files under models/, skipping projectors, drafts, and partial files."""
+    """Return finished model candidates under models/ in a stable order."""
     models_dir = project_root / "models"
-    if not models_dir.is_dir():
-        return []
-    found: list[Path] = []
-    for gguf in models_dir.rglob("*.gguf"):
-        lowered = gguf.name.lower()
-        if "mmproj" in lowered or "mtp" in lowered:
-            continue
-        try:
-            if gguf.stat().st_size < MIN_MODEL_BYTES:
-                continue
-        except OSError:
-            continue
-        found.append(gguf.resolve())
-    return sorted(found, key=lambda path: path.name.lower())
+    found = (p.resolve() for p in models_dir.rglob("*.gguf") if _available_gguf(p))
+    return sorted(found, key=lambda p: (p.name.lower(), str(p)))
 
 
 def default_model(project_root: Path) -> Path | None:
     for alias in KNOWN_MODELS:
         candidate = known_model_path(project_root, alias)
-        if candidate.is_file():
+        if _available_gguf(candidate):
             return candidate.resolve()
     discovered = discover_models(project_root)
     return discovered[0] if discovered else None
 
 
 def resolve_model(target: str | Path, project_root: Path) -> Path | None:
-    """Resolve 'auto', a known alias, a path, or a file-name fragment to a GGUF file."""
+    """Resolve an alias, a path, or a file-name fragment to a GGUF file."""
     text = str(target).strip().strip("'\"")
     lowered = text.lower()
     if lowered in {"", "auto"}:
         return default_model(project_root)
     if lowered in MODEL_ALIASES:
-        target_alias = MODEL_ALIASES[lowered]
-        candidate = known_model_path(project_root, target_alias)
-        if candidate.is_file():
+        alias = MODEL_ALIASES[lowered]
+        candidate = known_model_path(project_root, alias)
+        if _available_gguf(candidate):
             return candidate.resolve()
-        for gguf in discover_models(project_root):
-            if model_alias(gguf, project_root) == target_alias:
-                return gguf
+        return next((p for p in discover_models(project_root) if model_alias(p, project_root) == alias), None)
     candidate = Path(text).expanduser()
     if candidate.is_file():
-        return candidate.resolve()
-    for gguf in discover_models(project_root):
-        if lowered in gguf.name.lower():
-            return gguf
-    return None
+        return candidate.resolve() if _available_gguf(candidate, discover=False) else None
+    return next((p for p in discover_models(project_root) if lowered in p.name.lower()), None)
 
 
 def model_alias(path: Path, project_root: Path) -> str | None:

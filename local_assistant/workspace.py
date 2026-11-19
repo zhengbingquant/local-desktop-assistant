@@ -22,7 +22,7 @@ class ToolError(RuntimeError):
 EXCLUDED_DIRS = {
     ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".next", ".nuxt", "target",
-    "dist", "build", ".idea", ".vscode",
+    "dist", "build", ".idea", ".vscode", ".local_assistant",
 }
 SENSITIVE_NAMES = {
     ".env", "credentials.json", "credentials.yaml", "credentials.yml", "secrets.json",
@@ -30,7 +30,7 @@ SENSITIVE_NAMES = {
 }
 SENSITIVE_SUFFIXES = {".pem", ".key", ".pfx", ".p12", ".keystore"}
 IGNORED_SUFFIXES = {
-    ".gguf", ".safetensors", ".pt", ".pth", ".bin", ".onnx", ".sqlite", ".db",
+    ".gguf", ".safetensors", ".pt", ".pth", ".bin", ".onnx", ".sqlite", ".sqlite3", ".db",
     ".dll", ".exe", ".pyd", ".pyc", ".zip", ".7z", ".pdf", ".png", ".jpg",
     ".jpeg", ".webp", ".mp4", ".mp3", ".wav",
 }
@@ -216,29 +216,33 @@ class WorkspaceTools:
         requested = Path(raw)
 
         if requested.is_absolute() or requested.drive:
-            target = requested.resolve(strict=False)
-        elif raw.startswith(("/", "\\")):
-            target = (self.root / raw.lstrip("/\\")).resolve(strict=False)
+            candidate = requested
         else:
-            target = (self.root / requested).resolve(strict=False)
+            candidate = self.root / raw.lstrip("/\\")
+        try:
+            relative = candidate.relative_to(self.root)
+        except ValueError as exc:
+            raise ToolError(f"Path '{path_str}' is outside workspace '{self.root}'.") from exc
 
-        if os.name == "nt" and any(":" in part for part in target.parts[1:]):
-            raise ToolError("Windows alternate data stream paths are blocked.")
+        # Inspect the original components before resolve() can hide a junction or symlink.
+        cursor = self.root
+        for part in relative.parts:
+            if part == "..":
+                if cursor == self.root:
+                    raise ToolError("The path leaves the workspace.")
+                cursor = cursor.parent
+                continue
+            if os.name == "nt":
+                reserved = os.path.isreserved(part) if hasattr(os.path, "isreserved") else Path(part).is_reserved()
+                if ":" in part or reserved or part.endswith((" ", ".")):
+                    raise ToolError("Reserved or ambiguous Windows paths are blocked.")
+            cursor = cursor / part
+            if _is_reparse_point(cursor):
+                raise ToolError("Symlinks and Windows junctions are not followed by workspace tools.")
 
-        if self.permission_mode != "full":
-            try:
-                target.relative_to(self.root)
-            except ValueError as exc:
-                raise ToolError(f"Path '{path_str}' is outside workspace '{self.root}'.") from exc
-
-        if target.is_relative_to(self.root):
-            cursor = self.root
-            for part in target.relative_to(self.root).parts:
-                if part in ("", "."):
-                    continue
-                cursor = cursor / part
-                if cursor.exists() and _is_reparse_point(cursor):
-                    raise ToolError("Symlinks and Windows junctions are not followed by workspace tools.")
+        target = cursor.resolve()
+        if not target.is_relative_to(self.root):
+            raise ToolError(f"Path '{path_str}' is outside workspace '{self.root}'.")
 
         return target
 
@@ -267,7 +271,7 @@ class WorkspaceTools:
         except ValueError:
             return True
         parts = relative.split("/")
-        if any(part.lower() in EXCLUDED_DIRS for part in parts[:-1]):
+        if any(part.lower() in EXCLUDED_DIRS for part in parts):
             return True
         if _is_sensitive(path, parts):
             return True
@@ -282,22 +286,28 @@ class WorkspaceTools:
         return False
 
     def _walk_files(self, base: Path, max_depth: int = 8):
-        start_depth = len(base.relative_to(self.root).parts)
-        for current, directories, filenames in os.walk(base, followlinks=False):
-            folder = Path(current)
-            depth = len(folder.relative_to(self.root).parts) - start_depth
-            directories[:] = [
-                name for name in directories
-                if name.lower() not in EXCLUDED_DIRS
-                and not self._ignored(folder / name)
-                and not _is_reparse_point(folder / name)
-            ]
-            if depth >= max_depth:
-                directories.clear()
-            for filename in filenames:
-                path = folder / filename
-                if not self._ignored(path) and not _is_reparse_point(path):
-                    yield path
+        pending = [(base, 0)]
+        while pending:
+            folder, depth = pending.pop()
+            try:
+                entries = os.scandir(folder)
+            except OSError:
+                continue
+            with entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    if self._ignored(path):
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if _is_link_info(info):
+                        continue
+                    if stat.S_ISDIR(info.st_mode) and depth < max_depth:
+                        pending.append((path, depth + 1))
+                    elif stat.S_ISREG(info.st_mode):
+                        yield path, info.st_size
 
     def list_files(
         self,
@@ -314,11 +324,7 @@ class WorkspaceTools:
             raise ToolError("This folder is excluded by the workspace file policy.")
 
         entries: list[str] = []
-        for file in self._walk_files(folder, max_depth=max_depth):
-            try:
-                size = file.stat().st_size
-            except OSError:
-                continue
+        for file, size in self._walk_files(folder, max_depth=max_depth):
             relative = file.relative_to(self.root).as_posix()
             suffix = " [large file; use a focused export]" if size > MAX_READ_BYTES else ""
             entries.append(f"{relative} ({size} bytes){suffix}")
@@ -339,9 +345,7 @@ class WorkspaceTools:
             raise ToolError("This file is ignored, binary, or marked as sensitive by the workspace policy.")
         if not file.is_file():
             raise ToolError(f"Not a workspace file: {path}")
-        if file.stat().st_size > MAX_READ_BYTES:
-            raise ToolError("File is over 2 MiB; inspect a smaller source file instead.")
-        data = file.read_bytes()
+        data = _read_bounded(file)
         if b"\0" in data:
             raise ToolError("Binary files cannot be read by this tool.")
         try:
@@ -380,18 +384,19 @@ class WorkspaceTools:
         files_scanned = 0
         needle = query.casefold()
         # The walker already applies the ignore policy; a directly named file was checked above.
-        iterable = [base] if base.is_file() else self._walk_files(base, max_depth=10)
-        for file in iterable:
+        iterable = [(base, base.stat().st_size)] if base.is_file() else self._walk_files(base, max_depth=10)
+        for file, size in iterable:
             if not fnmatch.fnmatch(file.name, file_glob):
                 continue
             files_scanned += 1
             if files_scanned > 4000:
                 break
             try:
-                if file.stat().st_size > MAX_READ_BYTES:
+                if size > MAX_READ_BYTES:
                     continue
-                data = file.read_bytes()
-                if b"\0" in data:
+                with file.open("rb") as stream:
+                    data = stream.read(size + 1)
+                if len(data) != size or b"\0" in data:
                     continue
                 content = data.decode("utf-8-sig")
             except (OSError, UnicodeError):
@@ -417,9 +422,7 @@ class WorkspaceTools:
             raise ToolError("This path is ignored, binary, or marked as sensitive by the workspace policy.")
         if target.exists() and not target.is_file():
             raise ToolError("write_file only creates or replaces files; it cannot replace a directory.")
-        old_bytes = target.read_bytes() if target.is_file() else None
-        if old_bytes is not None and len(old_bytes) > MAX_READ_BYTES:
-            raise ToolError("Replacing files over 2 MiB is blocked. Use a focused text replacement instead.")
+        old_bytes = _read_bounded(target) if target.is_file() else None
         old_text = _decode_text(old_bytes) if old_bytes is not None else ""
         proposed = _match_newlines(content, old_bytes)
         return self._approve_and_write(target, old_bytes, proposed)
@@ -432,9 +435,9 @@ class WorkspaceTools:
         target = self._safe_path(path)
         if self._ignored(target):
             raise ToolError("This file is ignored, binary, or marked as sensitive by the workspace policy.")
-        if not target.is_file() or target.stat().st_size > MAX_READ_BYTES:
-            raise ToolError("replace_text requires a readable text file no larger than 2 MiB.")
-        old_bytes = target.read_bytes()
+        if not target.is_file():
+            raise ToolError("replace_text requires a readable text file.")
+        old_bytes = _read_bounded(target)
         original = _decode_text(old_bytes)
         normalized_original = original.replace("\r\n", "\n").replace("\r", "\n")
         normalized_old = old_text.replace("\r\n", "\n").replace("\r", "\n")
@@ -461,7 +464,7 @@ class WorkspaceTools:
             if target.exists():
                 raise ToolError("The file was created while the proposed change was awaiting approval; refusing to overwrite it.")
         else:
-            if not target.is_file() or target.read_bytes() != old_bytes:
+            if not target.is_file() or _read_bounded(target) != old_bytes:
                 raise ToolError("The file changed while the proposed diff was awaiting approval; reread it and propose again.")
 
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -502,9 +505,7 @@ class WorkspaceTools:
             raise ToolError("Deletion of ignored, binary, or sensitive files is blocked by the workspace policy.")
         if not target.is_file():
             raise ToolError("delete_file only deletes a single regular file.")
-        before = target.read_bytes()
-        if len(before) > MAX_READ_BYTES:
-            raise ToolError("Deletion of files over 2 MiB is blocked.")
+        before = _read_bounded(target)
         content = _decode_text(before)
         if not self._show_diff(target.relative_to(self.root).as_posix(), content, ""):
             raise ToolError("The proposed deletion diff is too large to review; no file was changed.")
@@ -512,7 +513,7 @@ class WorkspaceTools:
         if not self._authorize(f"Delete {relative} ({len(before)} bytes)? [y/n]", scope="workspace"):
             return f"User declined deletion of {relative}. No file was changed."
         target = self._safe_path(relative)
-        if not target.is_file() or target.read_bytes() != before:
+        if not target.is_file() or _read_bounded(target) != before:
             raise ToolError("The file changed while deletion was awaiting approval; refusing to remove it.")
         target.unlink()
         return f"Deleted {relative}."
@@ -632,13 +633,15 @@ def _bounded_int(value: Any, low: int, high: int, name: str) -> int:
     return max(low, min(high, converted))
 
 
+def _is_link_info(info: os.stat_result) -> bool:
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 def _is_reparse_point(path: Path) -> bool:
     try:
-        info = path.lstat()
-    except OSError:
+        return _is_link_info(path.lstat())
+    except FileNotFoundError:
         return False
-    attributes = getattr(info, "st_file_attributes", 0)
-    return path.is_symlink() or bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
 
 
 def _is_sensitive(path: Path, relative_parts: list[str]) -> bool:
@@ -650,6 +653,17 @@ def _is_sensitive(path: Path, relative_parts: list[str]) -> bool:
     if any(word in name for word in ("password", "secret", "credential")):
         return True
     return any(part.lower() in {".ssh", "secrets", "credentials"} for part in relative_parts[:-1])
+
+
+def _read_bounded(path: Path) -> bytes:
+    with path.open("rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        if size > MAX_READ_BYTES:
+            raise ToolError("File exceeds the 2 MiB workspace tool limit.")
+        data = stream.read(size + 1)
+    if len(data) != size:
+        raise ToolError("The file changed size while it was being read. Retry the operation.")
+    return data
 
 
 def _decode_text(data: bytes | None) -> str:

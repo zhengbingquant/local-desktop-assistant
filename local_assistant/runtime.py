@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import secrets
@@ -373,7 +374,9 @@ class LocalModelServer:
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
-                    if not data or data == "[DONE]":
+                    if data == "[DONE]":
+                        break
+                    if not data:
                         continue
                     try:
                         chunk = json.loads(data)
@@ -410,26 +413,28 @@ class LocalModelServer:
                         index = int(fragment.get("index", 0))
                         entry = tool_fragments.setdefault(
                             index,
-                            {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                            {"id": "", "name": [], "arguments": []},
                         )
                         if fragment.get("id"):
                             entry["id"] = fragment["id"]
                         function = fragment.get("function") or {}
                         if function.get("name"):
-                            entry["function"]["name"] += str(function["name"])
+                            entry["name"].append(str(function["name"]))
                         arguments = function.get("arguments")
                         if isinstance(arguments, str):
-                            entry["function"]["arguments"] += arguments
+                            entry["arguments"].append(arguments)
                         elif arguments is not None:
-                            entry["function"]["arguments"] += json.dumps(arguments, ensure_ascii=False)
+                            entry["arguments"].append(json.dumps(arguments, ensure_ascii=False))
         except urllib.error.HTTPError as exc:
             detail = exc.read(16_000).decode("utf-8", errors="replace")
             raise _model_error(exc.code, detail) from exc
-        except (OSError, urllib.error.URLError) as exc:
+        except (OSError, http.client.HTTPException) as exc:
             raise ModelError(f"Could not get a response from the local model: {exc}") from exc
         finally:
             clear_status()
 
+        if finish_reason is None:
+            raise ModelError("The local generation stream ended before completion. Any partial tool call was discarded.")
         result: dict[str, Any] = {"role": "assistant", "content": "".join(content)}
         if finish_reason:
             result["_finish_reason"] = finish_reason
@@ -439,9 +444,11 @@ class LocalModelServer:
             calls = []
             for index in sorted(tool_fragments):
                 call = tool_fragments[index]
-                if not call["id"]:
-                    call["id"] = f"call_{response_id or 'local'}_{index}"
-                calls.append(call)
+                calls.append({
+                    "id": call["id"] or f"call_{response_id or 'local'}_{index}",
+                    "type": "function",
+                    "function": {"name": "".join(call["name"]), "arguments": "".join(call["arguments"])},
+                })
             result["tool_calls"] = calls
         if usage or timings:
             result["_metrics"] = {"usage": usage, "timings": timings}

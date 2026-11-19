@@ -6,7 +6,7 @@ The local server is only an inference backend. It listens on loopback on an ephe
 
 Read-only tools inspect files in the selected workspace. The session starts in `/permission ask`, where file creation, replacement, and deletion show a proposed diff and require approval; PowerShell commands also require approval and display their exact command and working directory. `/permission workspace` auto-applies workspace file changes after showing their diff but still asks before shell commands. `/permission full` skips per-action approval for the current session.
 
-Web research defaults to automatic: the model searches for explicit lookups, current facts, and uncertain answers. Search queries go to DuckDuckGo, each call is displayed, and only public HTTPS pages are fetched. Use `/web off` to disable.
+The agent starts with web tools disabled. `/web auto`, `-EnableWeb`, or `--web-mode auto` enables research for the current run. The terminal shows each query sent to DuckDuckGo and each public HTTPS page request. Switching to a different workspace restores the `ask` file and shell permissions.
 
 On Windows, the model server and assistant-launched commands are attached to a Job Object configured with `KILL_ON_JOB_CLOSE`. Closing the CLI window stops everything automatically.
 
@@ -37,9 +37,9 @@ The reasoning-effort instruction sits at the very start of the Qwen3.8 prompt, s
 ## Tool calls
 
 - **Truncated calls**: when a response hits the output limit inside a tool call, its JSON arguments are incomplete. Kept verbatim in history, llama-server rejects every later request with `Failed to parse tool call arguments as JSON` until the chat is reset. The harness stores such calls with empty arguments and tells the model that nothing ran and to write smaller pieces. Saved sessions are cleaned the same way when loaded.
-- **Interrupted turns**: Ctrl+C during a tool call still records a result for each pending call, so the history stays well-formed.
+- **Interrupted turns**. Ctrl+C during a tool call records a result for each pending call. An interrupted model stream cannot dispatch a partially received function call. The agent keeps unanswered user input and completed tool results when a turn is interrupted or the server returns an error.
 - **Summary after the tool-call limit** keeps the same tool list with `tool_choice: "none"`. Sending no tools would change the prompt prefix and force the whole conversation to be re-processed.
-- **Edits over rewrites**: the system prompt asks for `replace_text` when changing existing files and for files under about 200 lines per `write_file`. On the 27B, output runs at about 3 tokens per second, so rewriting a 200-line file to change one line costs roughly ten minutes.
+- **Edits over rewrites**: the system prompt asks for `replace_text` when changing existing files and manageable `write_file` calls. On the 27B, output runs at about 3 tokens per second, so rewriting a 200-line file to change one line costs roughly ten minutes.
 - **Code blocks without tool calls**: weaker models sometimes print a file in markdown instead of calling `write_file`. The harness turns such a block into a `write_file` call only when the file does not exist yet, the target is unambiguous, and the fence language matches the extension. An explanation that quotes part of an existing file can never overwrite it, and a shell snippet next to `python app.py` is not saved as `app.py`.
 - **Legacy formats**: the bundled `llama-server` uses the GGUF's Jinja template with `--jinja`. The harness also accepts Qwen's textual `<tool_call>` XML, JSON in markdown fences, and `tool_name({...})` text as a fallback.
 
@@ -49,11 +49,19 @@ Answer text, reasoning, and ordinary code blocks stream as they arrive. Only a f
 
 ## Sessions
 
-Conversations are saved after every turn to `%LOCALAPPDATA%\LocalAssistant\sessions\<hash of the workspace path>.json` and resumed automatically when you start in the same folder. `/new` archives the current conversation so it can be resumed later with `/resume list`, then starts a fresh session. `/delete` permanently shreds the session file (overwritten with random data, then zeros, then deleted) and wipes any runtime logs that could contain prompt fragments; `/delete all` shreds every saved session across all workspaces (with a confirmation prompt). Earlier versions wrote `.local_assistant\chat-session.json` inside the workspace, where a transcript could be committed by accident; that file is moved to the new location the first time it is loaded.
+Each conversation has its own ID in `%LOCALAPPDATA%\LocalAssistant\sessions\history.sqlite3`. SQLite is included with Python and runs in the CLI process. The agent saves the accepted request before generation, completed tool rounds before the next inference call, and the final reply at the end of the turn. Each save commits the transcript, its revision and the workspace’s active chat together. The trade-off is a shared database file for backup and inspection. [SQLite atomic commit](https://www.sqlite.org/atomiccommit.html)
+
+- **Resume.** Startup reopens the active chat. `/resume` and `/resume list` read metadata in save-time order. The numbers refer to the last list displayed in this window, even if another window saves a chat. `/resume 2` switches to the original workspace and loads the selected conversation. If that folder has moved, open its new location and use `/resume 2 --here` to continue a separate copy there.
+- **Fresh chats.** `/new` records an empty active selection. Earlier chats remain available and an immediate restart still opens an empty chat.
+- **Concurrent windows.** Saves check the loaded revision. If two windows edit the same revision, the later save creates a separate chat so both histories survive. Clean exits skip transcript writes. A save error keeps the chat in memory and is reported in the terminal.
+- **Upgrade.** At startup the agent imports the older profile JSON files, including timestamped archives. Opening a workspace also imports its legacy `.local_assistant\chat-session.json`. Each original is removed after its transaction commits. A content-based ID makes interrupted imports repeatable. Malformed JSON stays on disk for recovery.
+- **Deletion.** `/delete` covers the current workspace and `/delete all` covers the profile store. Both ask for confirmation. The database enables SQLite’s `secure_delete` option. Backup copies and storage snapshots have their own retention policies. [SQLite secure deletion](https://www.sqlite.org/pragma.html#pragma_secure_delete)
 
 ## Local performance
 
-Benchmarks and the reasoning behind each runtime setting are in [model-setup.md](model-setup.md#tuning-for-this-laptop).
+A shorter fixed instruction block leaves more room for project guidance and conversation. The tool schema size estimate is computed once for each web mode. Keeping the shared prompt prefix stable between rounds allows llama.cpp to reuse cached tokens. [llama.cpp prompt caching](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+
+Workspace listing and text search use `os.scandir()` and carry each entry’s size from the directory scan into the file tools. On Windows, ordinary entries expose these attributes in the enumeration result. Streamed function arguments are collected in fragments and joined once when the server finishes. Earlier hardware measurements and runtime settings are in the model notes. [Python directory scanning](https://docs.python.org/3/library/os.html#os.scandir) · [Model setup and benchmarks](model-setup.md#tuning-for-this-laptop)
 
 ## Primary references
 

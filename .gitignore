@@ -11,6 +11,8 @@ weights/
 *.onnx
 *.log
 *.sqlite
+*.sqlite3
+*.sqlite3-*
 *.db
 __pycache__/
 *.py[cod]

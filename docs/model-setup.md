@@ -12,7 +12,7 @@ The assistant reads each GGUF file's embedded metadata (`local_assistant/models.
 | `general.sampling.*` | Recommended temperature / top-p / top-k when the GGUF ships them |
 | `general.name` | Display name and the model identity given to the assistant |
 
-Any other GGUF placed under `models/` shows up in `/model` and can be selected with `/model <part of the file name>` or `-ModelPath`.
+The `/model` menu shows discovered model filenames and selects the exact file, including when several quantizations share the same model name. Discovery skips projectors, draft files, files under 100 MiB and downloads with an aria2 control file. Use `/model <part of the file name>` for a unique match or `-ModelPath` for an explicit GGUF path.
 
 ## Supported models
 
@@ -50,7 +50,7 @@ With a q8_0 KV cache and a 512 MiB VRAM reserve it fits entirely on the GPU at 8
 
 ### Results
 
-Measured with the agent's real system prompt and tool schemas through `llama-server`.
+These figures were recorded with the system prompt and tool schemas used for the original llama.cpp tuning run. The current harness uses shorter instructions and defaults to offline tools.
 
 #### Qwen3.8-27B
 

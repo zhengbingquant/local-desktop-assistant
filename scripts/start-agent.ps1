@@ -88,7 +88,7 @@ $modelArgument = if ($ModelPath) {
 } else {
     $Model
 }
-$webMode = if ($DisableWeb) { 'off' } else { 'auto' }
+$webMode = if ($EnableWeb) { 'auto' } else { 'off' }
 $arguments = @(
     '-m', 'local_assistant',
     '--workspace', $workspace,

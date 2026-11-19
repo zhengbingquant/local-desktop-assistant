@@ -39,8 +39,8 @@ def main() -> int:
     web_group.add_argument(
         "--web-mode",
         choices=("auto", "off"),
-        default="auto",
-        help="let the model choose relevant public web lookups, or disable web access (default: auto)",
+        default="off",
+        help="enable automatic public web lookups or keep research offline (default: off)",
     )
     web_group.add_argument("--enable-web", dest="web_mode", action="store_const", const="auto", help=argparse.SUPPRESS)
     web_group.add_argument("--disable-web", dest="web_mode", action="store_const", const="off", help="disable all web tools")
