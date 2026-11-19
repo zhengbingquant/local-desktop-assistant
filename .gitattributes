@@ -2,7 +2,7 @@
 * text=auto
 
 # Explicitly mark text files.
-*.py text eol=lf
+*.rs text eol=lf linguist-language=Rust
 *.md text eol=lf
 *.ps1 text eol=lf
 *.bat text eol=crlf
