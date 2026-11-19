@@ -2,7 +2,7 @@
 
 ## How models are detected
 
-The assistant reads each GGUF file's embedded metadata (`local_assistant/models.py`, standard library only) instead of guessing from file names:
+The assistant reads each GGUF file's embedded metadata in `src/model.rs` instead of guessing from file names:
 
 | Metadata | Used for |
 | :-- | :-- |
@@ -37,7 +37,7 @@ With a q8_0 KV cache and a 512 MiB VRAM reserve it fits entirely on the GPU at 8
 
 **Machine**: AMD Ryzen 5 7640HS (6 cores / 12 threads, Zen 4) · 32 GB DDR5-5600 dual channel · NVIDIA RTX 4050 Laptop GPU, 6 GB, PCIe 4.0 x8 · Windows 11 · llama.cpp b11748 (CUDA 13.4 build).
 
-`plan_runtime()` in `local_assistant/models.py` picks settings per model. A model counts as *GPU-resident* when its weights take at most 80% of total VRAM.
+`Model::inspect()` in `src/model.rs` picks settings per model. A model counts as *GPU-resident* when its weights take at most 80% of total VRAM.
 
 | Setting | Spills into RAM (27B) | GPU-resident (7B) | Old default |
 | :-- | :-- | :-- | :-- |
@@ -50,7 +50,7 @@ With a q8_0 KV cache and a 512 MiB VRAM reserve it fits entirely on the GPU at 8
 
 ### Results
 
-These figures were recorded with the system prompt and tool schemas used for the original llama.cpp tuning run. The current harness uses shorter instructions and defaults to offline tools.
+These figures were recorded with the system prompt and tool schemas used for the original llama.cpp tuning run. They predate the Rust port. The Rust controller carries forward the runtime settings and defaults to offline tools.
 
 #### Qwen3.8-27B
 
@@ -89,7 +89,7 @@ These figures were recorded with the system prompt and tool schemas used for the
 ## Runtime and download
 
 - **Inference**: standalone `llama.cpp`; Ollama is not required. `.\scripts\install-runtime.ps1` downloads the tested build (b11748, CUDA 13) into `runtime\llama.cpp` and checks the SHA-256 digests GitHub publishes. Use `-Backend cuda-12` for older NVIDIA drivers, `-Backend vulkan` or `-Backend cpu` without an NVIDIA GPU, and `-Tag latest -Force` to upgrade.
-- **Entry point**: `llama-server.exe`, launched by the Python harness, bound to `127.0.0.1` on a temporary port with a per-session API key.
-- **Server config**: Web UI disabled, built-in agent tools disabled, `--offline` set. The harness calls the OpenAI-compatible chat-completions endpoint locally.
+- **Entry point**: `llama-server.exe`, launched by the Rust controller, bound to `127.0.0.1` on a temporary port with a per-session API key.
+- **Server config**: Web UI disabled, built-in agent tools disabled, `--offline` set. The Rust controller calls the chat-completions endpoint locally. Weights and runtime setup are available through `luma download` and `luma install-runtime`. The old PowerShell scripts forward to these commands.
 - **Plain chat**: `.\scripts\start-cli.ps1 [-Model auto|27b|7b]` gives a direct chat without workspace tools.
 - Models, caches, and runtime binaries are machine-local and excluded from Git.
